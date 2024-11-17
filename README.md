@@ -24,6 +24,10 @@ A Python SDK for efficiently storing and managing pandas DataFrames in AWS S3, w
   - User isolation (separate S3 buckets)
   - AWS Cognito authentication
   - Fine-grained access control
+- **Flexible Authentication**:
+  - Username/password authentication
+  - Token-based authentication
+  - Automatic token refresh
 
 ## Installation
 
@@ -37,7 +41,14 @@ pip install pandas-db-sdk
 from pandas_db_sdk.client import DataFrameClient
 import pandas as pd
 
-# Initialize client
+# Initialize client with username/password
+client = DataFrameClient(
+    api_url='your-api-url',
+    user='your-username',
+    password='your-password'
+)
+
+# Or initialize with an existing token
 client = DataFrameClient(
     api_url='your-api-url',
     auth_token='your-cognito-token'
@@ -59,6 +70,36 @@ client.load_dataframe(
 
 # Retrieve DataFrame
 df_retrieved = client.get_dataframe('my-project/dataset1')
+```
+
+## Authentication
+
+Three ways to authenticate:
+
+1. **Username/Password**:
+```python
+client = DataFrameClient(
+    api_url='your-api-url',
+    user='your-username',
+    password='your-password'
+)
+```
+
+2. **Existing Token**:
+```python
+client = DataFrameClient(
+    api_url='your-api-url',
+    auth_token='your-cognito-token'
+)
+```
+
+3. **Get Token Only**:
+```python
+token = DataFrameClient.get_auth_token(
+    api_url='your-api-url',
+    user='your-username',
+    password='your-password'
+)
 ```
 
 ## Key Concepts
@@ -145,9 +186,23 @@ client.load_dataframe(
 class DataFrameClient:
     """Client for managing pandas DataFrames in cloud storage"""
     
+    @staticmethod
+    def get_auth_token(
+        api_url: str,
+        user: str,
+        password: str,
+        region: str = 'eu-west-1'
+    ) -> str:
+        """
+        Get authentication token using username and password
+        
+        Returns:
+            Authentication token string
+        """
+    
     def load_dataframe(
         self,
-        df: pd.DataFrame,
+        df: Union[pd.DataFrame, str, Dict],
         dataframe_name: str,
         columns_keys: Optional[Dict[str, str]] = None,
         external_key: str = 'NOW',
@@ -157,7 +212,7 @@ class DataFrameClient:
         Store a DataFrame with optional partitioning and versioning.
         
         Args:
-            df: DataFrame to store
+            df: DataFrame to store (DataFrame, JSON string, or dict)
             dataframe_name: Name/path for storage
             columns_keys: Column partitioning settings
             external_key: Version identifier
@@ -183,6 +238,22 @@ class DataFrameClient:
             
         Returns:
             Retrieved DataFrame
+        """
+        
+    def delete_dataframe(
+        self,
+        dataframe_name: str,
+        external_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Delete a stored DataFrame.
+        
+        Args:
+            dataframe_name: Name/path of DataFrame
+            external_key: Optional version filter
+            
+        Returns:
+            Deletion confirmation
         """
 ```
 
@@ -215,6 +286,19 @@ bucket/
             ├── 2024-01-01/
             │   └── 123456_chunk_uuid.csv.gz
             └── last_key.txt
+```
+
+## Error Handling
+
+The SDK provides custom exceptions for better error handling:
+
+```python
+try:
+    client.load_dataframe(df, 'test/df1')
+except AuthenticationError as e:
+    print(f"Authentication failed: {e}")
+except APIError as e:
+    print(f"API call failed: {e}")
 ```
 
 ## Requirements

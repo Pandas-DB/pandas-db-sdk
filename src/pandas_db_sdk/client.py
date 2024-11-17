@@ -31,7 +31,7 @@ df_latest = client.get_dataframe(
 dataframes = client.list_dataframes(prefix='my-test/')
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import requests
 
 import boto3

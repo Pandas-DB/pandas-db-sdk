@@ -34,7 +34,7 @@ pip install pandas-db-sdk
 ## Quick Start
 
 ```python
-from pandas_db_sdk import DataFrameClient
+from pandas_db_sdk.client import DataFrameClient
 import pandas as pd
 
 # Initialize client

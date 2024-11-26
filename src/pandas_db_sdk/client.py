@@ -4,6 +4,7 @@ import boto3
 import pandas as pd
 from datetime import datetime
 import json
+from urllib.parse import quote
 
 class DataFrameClientError(Exception):
     """Base exception for DataFrameClient errors"""
@@ -99,10 +100,10 @@ class DataFrameClient:
             
         if not self._auth_token:
             raise ValueError("Either auth_token or user/password credentials are required")
-            
+
         self.headers = {
             'Authorization': f"Bearer {self._auth_token}",
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
         }
 
     def _refresh_token_if_needed(self) -> None:
@@ -214,19 +215,11 @@ class DataFrameClient:
     ) -> pd.DataFrame:
         """
         Retrieve DataFrame from storage
-
-        Args:
-            dataframe_name: Name/path of the DataFrame to retrieve
-            external_key: Optional external key to filter by
-            use_last: If True, returns only the latest version
-
-        Returns:
-            pd.DataFrame: Retrieved DataFrame
-
-        Raises:
-            APIError: If API call fails
         """
         self._refresh_token_if_needed()
+
+        # URL encode the dataframe name to handle slashes properly
+        encoded_name = quote(dataframe_name, safe='')
 
         # Prepare query parameters
         params = {}
@@ -235,19 +228,31 @@ class DataFrameClient:
         if use_last:
             params['use_last'] = 'true'
 
-        # Make request
+        # Make request with explicit header formatting
+        headers = {
+            'Authorization': self._auth_token,  # Remove Bearer prefix
+            'Content-Type': 'application/json'
+        }
+
         try:
             response = requests.get(
-                f"{self.api_url}/dataframes/{dataframe_name}",
-                headers=self.headers,
+                f"{self.api_url}/dataframes/get/{encoded_name}",  # Updated URL format
+                headers=headers,
                 params=params
             )
+
+            if not response.ok:
+                print(f"Error response: {response.text}")  # Debug logging
+
             response.raise_for_status()
             return pd.DataFrame(response.json())
 
         except requests.exceptions.RequestException as e:
             if hasattr(e.response, 'json'):
-                error = e.response.json().get('error', str(e))
+                try:
+                    error = e.response.json().get('error', str(e))
+                except:
+                    error = e.response.text if e.response else str(e)
             else:
                 error = str(e)
             raise APIError(f"Error retrieving DataFrame: {error}")

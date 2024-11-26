@@ -1,25 +1,29 @@
-import pytest
+from os import getenv
 
-from pandas_db_sdk.skeleton import fib, main
-
-__author__ = "Sergi Ortiz"
-__copyright__ = "Sergi Ortiz"
-__license__ = "MIT"
+from pandas_db_sdk.client import DataFrameClient
+import pandas as pd
 
 
-def test_fib():
-    """API Tests"""
-    assert fib(1) == 1
-    assert fib(2) == 1
-    assert fib(7) == 13
-    with pytest.raises(AssertionError):
-        fib(-10)
+user = getenv('USER')
+password = getenv('PASS')
+api_url = getenv('API_URL')
 
+# Initialize client with username/password
+client = DataFrameClient(api_url=api_url, user=user, password=password)
 
-def test_main(capsys):
-    """CLI Tests"""
-    # capsys is a pytest fixture that allows asserts against stdout/stderr
-    # https://docs.pytest.org/en/stable/capture.html
-    main(["7"])
-    captured = capsys.readouterr()
-    assert "The 7-th Fibonacci number is 13" in captured.out
+# Create sample DataFrame
+df = pd.DataFrame({
+    'date': ['2024-01-01', '2024-01-02'],
+    'id': [1, 2],
+    'value': [100, 200]
+})
+
+# Store DataFrame (automatically partitioned by date)
+client.load_dataframe(
+    df=df,
+    dataframe_name='my-project/dataset1',
+    columns_keys={'date': 'Date'}
+)
+
+# Retrieve DataFrame
+df_retrieved = client.get_dataframe('my-project/dataset1')

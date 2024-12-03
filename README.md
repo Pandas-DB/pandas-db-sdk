@@ -116,39 +116,61 @@ DataFrames can be organized hierarchically:
 Two types of keys determine how your data is stored:
 
 1. **Column Keys**:
-   - `Date`: Partitions data by date
-   - `ID`: Partitions data by ID ranges
+  - `Date`: Partitions data by date
+  - `ID`: Partitions data by ID ranges
 
 2. **External Keys**:
-   - `NOW`: Automatic timestamp-based versioning
-   - Custom keys: Your own versioning scheme
+  - `NOW`: Automatic timestamp-based versioning
+  - Custom keys: Your own versioning scheme
 
-### Versioning
-- **Default**: Keeps all versions, allowing for data accumulation
-- **Keep Last**: Only maintains the most recent version
-- **Custom**: Use external keys for your own versioning scheme
+### Storage Methods
+1. **Concat** (default):
+  - Preserves existing data and appends new data 
+  - Maintains unaffected partitions unchanged
+
+2. **keep_last**:
+  - Replaces data only where new data exists
+  - Preserves data in unaffected partitions
 
 ## Usage Examples
 
 ### 1. Time Series Data
-
 ```python
-# Store time series with date partitioning
+# Concat mode (default)
 client.load_dataframe(
-    df,
-    'timeseries/daily_metrics',
-    columns_keys={'timestamp': 'Date'}
+   df,
+   'timeseries/daily_metrics',
+   columns_keys={'timestamp': 'Date'}
+)
+
+# Replace mode (only those dates that collide)
+client.load_dataframe(
+   df,
+   'timeseries/daily_metrics',
+   columns_keys={'timestamp': 'Date'},
+   storage_method='keep_last'
 )
 ```
 
 ### 2. User Data with ID Ranges
 
 ```python
-# Store user data partitioned by ID ranges
+# Concat mode with ID partitioning
 client.load_dataframe(
     df,
     'users/profiles',
     columns_keys={'user_id': 'ID'}
+)
+
+# Replace mode (those ID ranges or Dates that collide) with multiple partitions
+client.load_dataframe(
+    df,
+    'transactions',
+    columns_keys={
+        'transaction_date': 'Date',
+        'customer_id': 'ID'
+    },
+    storage_method='keep_last'
 )
 ```
 

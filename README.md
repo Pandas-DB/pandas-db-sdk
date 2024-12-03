@@ -196,7 +196,9 @@ client.load_dataframe(
     'transactions',
     columns_keys={
         'transaction_date': 'Date',
-        'customer_id': 'ID'
+        'updated_date': 'Date',
+        'customer_id': 'ID',
+        'product_id': 'ID',
     }
 )
 ```

@@ -141,7 +141,8 @@ class DataFrameClient:
             dataframe_name: str,
             columns_keys: Optional[Dict[str, str]] = None,
             external_key: str = 'NOW',
-            keep_last: bool = False
+            keep_last: bool = False,
+            storage_method: str = 'concat'  # Added parameter
     ) -> Dict:
         """
         Load DataFrame to storage system
@@ -152,6 +153,7 @@ class DataFrameClient:
             columns_keys: Optional dictionary mapping column names to key types ('Date' or 'ID')
             external_key: Key for version organization ('NOW' or custom path)
             keep_last: If True, only keeps the latest version
+            storage_method: Storage method ('concat' or 'keep_last')
 
         Returns:
             Dict: Storage metadata
@@ -162,24 +164,48 @@ class DataFrameClient:
         """
         self._refresh_token_if_needed()
 
-        # Convert input to DataFrame if needed
+        # Input validation
         if isinstance(df, str):
-            df = pd.read_json(df)
+            try:
+                df = pd.read_json(df)
+            except Exception as e:
+                raise ValueError(f"Failed to parse JSON string: {str(e)}")
         elif isinstance(df, dict):
-            df = pd.DataFrame.from_dict(df)
+            try:
+                df = pd.DataFrame.from_dict(df)
+            except Exception as e:
+                raise ValueError(f"Failed to create DataFrame from dictionary: {str(e)}")
         elif not isinstance(df, pd.DataFrame):
             raise ValueError("df must be a pandas DataFrame, JSON string, or dictionary")
 
-        # Validate inputs
         if not dataframe_name:
             raise ValueError("dataframe_name is required")
 
+        if storage_method not in ['concat', 'keep_last']:
+            raise ValueError("storage_method must be either 'concat' or 'keep_last'")
+
+        # Validate columns_keys
         if columns_keys:
+            reserved_words = {'log', 'default'}
             for col, key_type in columns_keys.items():
+                if col in reserved_words:
+                    raise ValueError(f"Column name '{col}' is reserved")
                 if key_type not in ['Date', 'ID']:
                     raise ValueError(f"Invalid key type for {col}: {key_type}")
                 if col not in df.columns:
                     raise ValueError(f"Column not found in DataFrame: {col}")
+
+                # Validate date columns can be converted to datetime
+                if key_type == 'Date':
+                    try:
+                        pd.to_datetime(df[col])
+                    except Exception as e:
+                        raise ValueError(f"Column '{col}' cannot be converted to datetime: {str(e)}")
+
+                # Validate ID columns contain numeric data
+                if key_type == 'ID':
+                    if not pd.api.types.is_numeric_dtype(df[col]):
+                        raise ValueError(f"Column '{col}' must contain numeric IDs")
 
         # Prepare request
         payload = {
@@ -187,7 +213,8 @@ class DataFrameClient:
             'dataframe_name': dataframe_name,
             'columns_keys': columns_keys or {},
             'external_key': external_key,
-            'keep_last': keep_last
+            'keep_last': keep_last,
+            'storage_method': storage_method
         }
 
         # Make request

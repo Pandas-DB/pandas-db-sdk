@@ -168,6 +168,7 @@ client.load_dataframe(
     'transactions',
     columns_keys={
         'transaction_date': 'Date',
+        'updated_date': 'Date',
         'customer_id': 'ID'
     },
     storage_method='keep_last'

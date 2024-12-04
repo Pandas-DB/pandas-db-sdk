@@ -1,67 +1,111 @@
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any, Union, List
+from dataclasses import dataclass
 import requests
 import boto3
 import pandas as pd
+import numpy as np
 from datetime import datetime
 import json
 from urllib.parse import quote
 
-class DataFrameClientError(Exception):
-    """Base exception for DataFrameClient errors"""
-    pass
 
-class AuthenticationError(DataFrameClientError):
-    """Raised when authentication fails"""
-    pass
+# TODO this can go to an aux.py
+def convert_numpy_types(value):
+    """Convert numpy types to native Python types"""
+    import numpy as np
+    if isinstance(value, (np.int_, np.intc, np.intp, np.int8,
+                          np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                          np.uint32, np.uint64)):
+        return int(value)
+    elif isinstance(value, (np.float_, np.float16, np.float32, np.float64)):
+        return float(value)
+    elif isinstance(value, (np.bool_)):
+        return bool(value)
+    elif isinstance(value, (np.ndarray,)):
+        return value.tolist()
+    return value
 
-class APIError(DataFrameClientError):
-    """Raised when API calls fail"""
-    pass
+
+class DataFrameClientError(Exception): pass
+
+
+class AuthenticationError(DataFrameClientError): pass
+
+
+class APIError(DataFrameClientError): pass
+
+
+@dataclass
+class Filter:
+    column: str
+    partition_type: str
+    value: Optional[str] = None
+
+
+@dataclass
+class DateRangeFilter:
+    column: str
+    start_date: str
+    end_date: str
+    partition_type: str = 'date'
+    value: Optional[str] = None
+
+    def to_filter_params(self) -> Dict[str, str]:
+        return {
+            'partition_type': self.partition_type,
+            'column': self.column,
+            'start_date': self.start_date,
+            'end_date': self.end_date
+        }
+
+
+@dataclass
+class LogRangeFilter:
+    column: str
+    start_timestamp: str
+    end_timestamp: str
+    partition_type: str = 'log'
+    value: Optional[str] = None
+
+    def to_filter_params(self) -> Dict[str, str]:
+        return {
+            'partition_type': self.partition_type,
+            'column': self.column,  # Changed from external_key to column
+            'start_timestamp': self.start_timestamp,
+            'end_timestamp': self.end_timestamp
+        }
+
+
+@dataclass
+class IdFilter:
+    column: str
+    value: Optional[str] = None
+    partition_type: str = 'id'
+
+    def to_filter_params(self) -> Dict[str, str]:
+        return {
+            'partition_type': self.partition_type,
+            'column': self.column,  # Changed from external_key to column
+            'partition_value': self.value
+        }
+
 
 class DataFrameClient:
-    """Client for interacting with the DataFrame storage service"""
-
     @staticmethod
     def get_auth_token(api_url: str, user: str, password: str, region: str = 'eu-west-1') -> str:
-        """
-        Get authentication token using username and password
-
-        Args:
-            api_url: Base URL for the API
-            user: Cognito username/email
-            password: Cognito password
-            region: AWS region
-
-        Returns:
-            str: Authentication token
-
-        Raises:
-            AuthenticationError: If authentication fails
-        """
-        # Clean API URL
         api_url = api_url.rstrip('/')
-        
-        # Get User Pool info
         try:
             response = requests.get(f"{api_url}/auth/config")
             response.raise_for_status()
-            pool_info = response.json()
-            client_id = pool_info['userPoolClientId']
-        except requests.exceptions.RequestException as e:
-            raise AuthenticationError(f"Error getting authentication configuration: {str(e)}")
+            client_id = response.json()['userPoolClientId']
 
-        # Authenticate with Cognito
-        try:
             cognito = boto3.client('cognito-idp', region_name=region)
-            response = cognito.initiate_auth(
+            auth = cognito.initiate_auth(
                 ClientId=client_id,
                 AuthFlow='USER_PASSWORD_AUTH',
-                AuthParameters={
-                    'USERNAME': user,
-                    'PASSWORD': password
-                }
+                AuthParameters={'USERNAME': user, 'PASSWORD': password}
             )
-            return response['AuthenticationResult']['IdToken']
+            return auth['AuthenticationResult']['IdToken']
         except Exception as e:
             raise AuthenticationError(f"Authentication failed: {str(e)}")
 
@@ -73,95 +117,77 @@ class DataFrameClient:
             auth_token: str = None,
             region: str = 'eu-west-1'
     ):
-        """
-        Initialize DataFrame client
-
-        Args:
-            api_url: Base URL for the API
-            user: Cognito username/email
-            password: Cognito password
-            auth_token: Optional pre-existing auth token
-            region: AWS region
-
-        Raises:
-            ValueError: If neither auth_token nor user/password credentials are provided
-            AuthenticationError: If authentication fails
-        """
         self.api_url = api_url.rstrip('/')
         self.region = region
         self.user = user
         self.password = password
-        
-        # Get auth token if not provided
+
         if not auth_token and user and password:
             self._auth_token = self.get_auth_token(api_url, user, password, region)
         else:
             self._auth_token = auth_token
-            
+
         if not self._auth_token:
-            raise ValueError("Either auth_token or user/password credentials are required")
+            raise ValueError("Either auth_token or user/password required")
 
         self.headers = {
             'Authorization': f"Bearer {self._auth_token}",
-            'Content-Type': 'application/json',
+            'Content-Type': 'application/json'
         }
 
     def _refresh_token_if_needed(self) -> None:
-        """
-        Check token validity and refresh if needed
-
-        Raises:
-            AuthenticationError: If token refresh fails
-        """
         try:
-            # Try a simple API call to test token
-            response = requests.get(
-                f"{self.api_url}/auth/verify",
-                headers=self.headers
-            )
-            
-            # If unauthorized, try to refresh token
+            response = requests.get(f"{self.api_url}/auth/verify", headers=self.headers)
             if response.status_code == 401 and self.user and self.password:
                 self._auth_token = self.get_auth_token(
-                    self.api_url,
-                    self.user,
-                    self.password,
-                    self.region
+                    self.api_url, self.user, self.password, self.region
                 )
                 self.headers['Authorization'] = f"Bearer {self._auth_token}"
             elif response.status_code == 401:
-                raise AuthenticationError("Token expired and refresh credentials not available")
-                
+                raise AuthenticationError("Token expired and no refresh credentials")
         except requests.exceptions.RequestException as e:
-            raise APIError(f"Error verifying token: {str(e)}")
+            raise APIError(f"Token verification failed: {str(e)}")
+
+    def get_dataframe(
+            self,
+            dataframe_name: str,
+            filter_by: Optional[Union[DateRangeFilter, LogRangeFilter, IdFilter]] = None,
+            use_last: bool = False
+    ) -> pd.DataFrame:
+        self._refresh_token_if_needed()
+        encoded_name = quote(dataframe_name, safe='')
+
+        params = {'use_last': str(use_last).lower()}
+
+        if filter_by:
+            params.update(filter_by.to_filter_params())
+
+        try:
+            response = requests.get(
+                f"{self.api_url}/dataframes/get/{encoded_name}",
+                headers=self.headers,
+                params=params
+            )
+            response.raise_for_status()
+            df = pd.DataFrame(response.json())
+
+            # Apply client-side filtering if needed
+            if len(df) > 0 and filter_by:
+                if isinstance(filter_by, IdFilter) and filter_by.value is not None:
+                    df = df[df[filter_by.column] == float(filter_by.value)]
+
+            return df
+        except requests.exceptions.RequestException as e:
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error retrieving DataFrame: {error}")
 
     def load_dataframe(
             self,
             df: Union[pd.DataFrame, str, Dict],
             dataframe_name: str,
             columns_keys: Optional[Dict[str, str]] = None,
-            external_key: str = 'NOW',
-            keep_last: bool = False,
-            storage_method: str = 'concat'  # Added parameter
+            storage_method: str = 'concat'
     ) -> Dict:
-        """
-        Load DataFrame to storage system
-
-        Args:
-            df: Pandas DataFrame, JSON string, or dictionary to store
-            dataframe_name: Name/path for the DataFrame
-            columns_keys: Optional dictionary mapping column names to key types ('Date' or 'ID')
-            external_key: Key for version organization ('NOW' or custom path)
-            keep_last: If True, only keeps the latest version
-            storage_method: Storage method ('concat' or 'keep_last')
-
-        Returns:
-            Dict: Storage metadata
-
-        Raises:
-            ValueError: If inputs are invalid
-            APIError: If API call fails
-        """
         self._refresh_token_if_needed()
 
         # Input validation
@@ -169,191 +195,103 @@ class DataFrameClient:
             try:
                 df = pd.read_json(df)
             except Exception as e:
-                raise ValueError(f"Failed to parse JSON string: {str(e)}")
+                raise ValueError(f"Invalid JSON string: {str(e)}")
         elif isinstance(df, dict):
             try:
                 df = pd.DataFrame.from_dict(df)
             except Exception as e:
-                raise ValueError(f"Failed to create DataFrame from dictionary: {str(e)}")
+                raise ValueError(f"Invalid dictionary format: {str(e)}")
         elif not isinstance(df, pd.DataFrame):
-            raise ValueError("df must be a pandas DataFrame, JSON string, or dictionary")
+            raise ValueError("df must be DataFrame, JSON string, or dictionary")
 
-        if not dataframe_name:
-            raise ValueError("dataframe_name is required")
-
-        if storage_method not in ['concat', 'keep_last']:
-            raise ValueError("storage_method must be either 'concat' or 'keep_last'")
-
-        # Validate columns_keys
+        # Column validation
+        date_columns = []
+        id_columns = []
         if columns_keys:
-            reserved_words = {'log', 'default'}
             for col, key_type in columns_keys.items():
-                if col in reserved_words:
+                if col in {'log', 'default'}:
                     raise ValueError(f"Column name '{col}' is reserved")
                 if key_type not in ['Date', 'ID']:
-                    raise ValueError(f"Invalid key type for {col}: {key_type}")
+                    raise ValueError(f"Invalid key type: {key_type}")
                 if col not in df.columns:
-                    raise ValueError(f"Column not found in DataFrame: {col}")
+                    raise ValueError(f"Column not found: {col}")
 
-                # Validate date columns can be converted to datetime
                 if key_type == 'Date':
                     try:
-                        pd.to_datetime(df[col])
+                        df[col] = pd.to_datetime(df[col])
+                        date_columns.append(col)
                     except Exception as e:
-                        raise ValueError(f"Column '{col}' cannot be converted to datetime: {str(e)}")
+                        raise ValueError(f"Invalid date format in {col}: {str(e)}")
 
-                # Validate ID columns contain numeric data
                 if key_type == 'ID':
                     if not pd.api.types.is_numeric_dtype(df[col]):
-                        raise ValueError(f"Column '{col}' must contain numeric IDs")
+                        raise ValueError(f"Column {col} must be numeric")
+                    id_columns.append(col)
 
-        # Prepare request
-        payload = {
-            'dataframe': df.to_json(orient='records'),
-            'dataframe_name': dataframe_name,
-            'columns_keys': columns_keys or {},
-            'external_key': external_key,
-            'keep_last': keep_last,
-            'storage_method': storage_method
-        }
+        # DataFrame to JSON conversion
+        try:
+            df_copy = df.copy()
 
-        # Make request
+            # Handle date columns
+            for date_col in date_columns:
+                df_copy[date_col] = df_copy[date_col].dt.strftime('%Y-%m-%d')
+
+            # Convert DataFrame to records and handle numpy types
+            records = df_copy.to_dict(orient='records')
+            for record in records:
+                for key, value in record.items():
+                    record[key] = convert_numpy_types(value)
+
+            json_data = json.dumps(records)
+        except Exception as error:
+            raise APIError(f"Error preparing dataframe for upload: {error}")
+
+        # API request
         try:
             response = requests.post(
                 f"{self.api_url}/dataframes/upload",
                 headers=self.headers,
-                json=payload
+                json={
+                    'dataframe': json_data,
+                    'dataframe_name': dataframe_name,
+                    'columns_keys': columns_keys or {},
+                    'storage_method': storage_method
+                }
             )
             response.raise_for_status()
             return response.json()
-
         except requests.exceptions.RequestException as e:
-            if hasattr(e.response, 'json'):
-                error = e.response.json().get('error', str(e))
-            else:
-                error = str(e)
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
             raise APIError(f"Error uploading DataFrame: {error}")
 
-    def get_dataframe(
-            self,
-            dataframe_name: str,
-            external_key: Optional[str] = None,
-            use_last: bool = False
-    ) -> pd.DataFrame:
-        """
-        Retrieve DataFrame from storage
-        """
+    def get_available_dates(self, dataframe_name: str, date_column: str) -> List[str]:
         self._refresh_token_if_needed()
-
-        # URL encode the dataframe name to handle slashes properly
         encoded_name = quote(dataframe_name, safe='')
 
-        # Prepare query parameters
-        params = {}
-        if external_key:
-            params['external_key'] = external_key
-        if use_last:
-            params['use_last'] = 'true'
+        try:
+            response = requests.get(
+                f"{self.api_url}/dataframes/{encoded_name}",
+                headers=self.headers,
+                params={'list': 'dates', 'date_column': date_column}
+            )
+            response.raise_for_status()
+            return response.json()['dates']
+        except requests.exceptions.RequestException as e:
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error getting available dates: {error}")
 
-        # Make request with explicit header formatting
-        headers = {
-            'Authorization': self._auth_token,  # Remove Bearer prefix
-            'Content-Type': 'application/json'
-        }
+    def get_log_timestamps(self, dataframe_name: str) -> List[str]:
+        self._refresh_token_if_needed()
+        encoded_name = quote(dataframe_name, safe='')
 
         try:
             response = requests.get(
-                f"{self.api_url}/dataframes/get/{encoded_name}",  # Updated URL format
-                headers=headers,
-                params=params
-            )
-
-            if not response.ok:
-                print(f"Error response: {response.text}")  # Debug logging
-
-            response.raise_for_status()
-            return pd.DataFrame(response.json())
-
-        except requests.exceptions.RequestException as e:
-            if hasattr(e.response, 'json'):
-                try:
-                    error = e.response.json().get('error', str(e))
-                except:
-                    error = e.response.text if e.response else str(e)
-            else:
-                error = str(e)
-            raise APIError(f"Error retrieving DataFrame: {error}")
-
-    def list_dataframes(
-            self,
-            prefix: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        List available DataFrames
-
-        Args:
-            prefix: Optional prefix to filter DataFrames
-
-        Returns:
-            Dict: DataFrame listings
-
-        Raises:
-            APIError: If API call fails
-        """
-        self._refresh_token_if_needed()
-
-        params = {'prefix': prefix} if prefix else {}
-
-        try:
-            response = requests.get(
-                f"{self.api_url}/dataframes",
+                f"{self.api_url}/dataframes/{encoded_name}",
                 headers=self.headers,
-                params=params
+                params={'list': 'timestamps'}
             )
             response.raise_for_status()
-            return response.json()
-
+            return response.json()['timestamps']
         except requests.exceptions.RequestException as e:
-            if hasattr(e.response, 'json'):
-                error = e.response.json().get('error', str(e))
-            else:
-                error = str(e)
-            raise APIError(f"Error listing DataFrames: {error}")
-
-    def delete_dataframe(
-            self,
-            dataframe_name: str,
-            external_key: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Delete DataFrame from storage
-
-        Args:
-            dataframe_name: Name/path of the DataFrame to delete
-            external_key: Optional external key to filter what to delete
-
-        Returns:
-            Dict: Deletion confirmation
-
-        Raises:
-            APIError: If API call fails
-        """
-        self._refresh_token_if_needed()
-
-        params = {'external_key': external_key} if external_key else {}
-
-        try:
-            response = requests.delete(
-                f"{self.api_url}/dataframes/{dataframe_name}",
-                headers=self.headers,
-                params=params
-            )
-            response.raise_for_status()
-            return response.json()
-
-        except requests.exceptions.RequestException as e:
-            if hasattr(e.response, 'json'):
-                error = e.response.json().get('error', str(e))
-            else:
-                error = str(e)
-            raise APIError(f"Error deleting DataFrame: {error}")
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error getting log timestamps: {error}")

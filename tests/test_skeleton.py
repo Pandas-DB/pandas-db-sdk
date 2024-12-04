@@ -1,29 +1,92 @@
 from os import getenv
-
-from pandas_db_sdk.client import DataFrameClient
 import pandas as pd
+from datetime import datetime, timedelta
+from pandas_db_sdk.client import DataFrameClient, DateRangeFilter, LogRangeFilter, IdFilter
 
+def test_dataframe_client():
+    # Initialize client
+    client = DataFrameClient(
+        api_url=getenv('API_URL'),
+        user=getenv('USER'),
+        password=getenv('PASS')
+    )
 
-user = getenv('USER')
-password = getenv('PASS')
-api_url = getenv('API_URL')
+    # Create sample DataFrame with multiple partition types
+    df = pd.DataFrame({
+        'transaction_date': pd.date_range(start='2024-01-01', periods=5),
+        'user_id': range(1000, 1005),
+        'amount': [100, 200, 300, 400, 500],
+        'category': ['A', 'B', 'A', 'C', 'B']
+    })
 
-# Initialize client with username/password
-client = DataFrameClient(api_url=api_url, user=user, password=password)
+    print("Original DataFrame:")
+    print(df)
 
-# Create sample DataFrame
-df = pd.DataFrame({
-    'date': ['2024-01-01', '2024-01-02'],
-    'id': [1, 2],
-    'value': [100, 200]
-})
+    '''
+    # Test 1: Basic Upload with Date Partitioning
+    print("\nTest 1: Upload with Date Partitioning")
+    metadata = client.load_dataframe(
+        df=df,
+        dataframe_name='test/transactions',
+        columns_keys={'transaction_date': 'Date'}
+    )
+    print("Upload metadata:", metadata)
 
-# Store DataFrame (automatically partitioned by date)
-client.load_dataframe(
-    df=df,
-    dataframe_name='my-project/dataset1',
-    columns_keys={'date': 'Date'}
-)
+    # Test 2: Upload with Multiple Partition Types
+    print("\nTest 2: Upload with Multiple Partitions")
+    metadata = client.load_dataframe(
+        df=df,
+        dataframe_name='test/transactions-multi',
+        columns_keys={
+            'transaction_date': 'Date',
+            'user_id': 'ID'
+        }
+    )
+    print("Upload metadata:", metadata)
+    '''
 
-# Retrieve DataFrame
-df_retrieved = client.get_dataframe('my-project/dataset1')
+    # Test 3: Retrieve by Date Range
+    print("\nTest 3: Retrieve by Date Range")
+    date_filter = DateRangeFilter(
+        column='transaction_date',
+        start_date='2024-01-04',
+        end_date='2024-01-08'
+    )
+    df_date = client.get_dataframe('test/transactions-multi', filter_by=date_filter)
+    print("Retrieved by date range:")
+    print(df_date)
+
+    # Test 4: Retrieve by ID
+    print("\nTest 4: Retrieve by ID")
+    id_filter = IdFilter(
+        column='user_id',
+        value='1002'
+    )
+    df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
+    print("Retrieved by ID:")
+    print(df_id)
+
+    # Test 5: Get Available Dates
+    print("\nTest 5: List Available Dates")
+    dates = client.get_available_dates('test/transactions', 'transaction_date')
+    print("Available dates:", dates)
+
+    # Test 6: Get Log Timestamps
+    print("\nTest 6: List Log Timestamps")
+    timestamps = client.get_log_timestamps('test/transactions')
+    print("Log timestamps:", timestamps)
+
+    # Test 7: Retrieve by Log Range
+    print("\nTest 7: Retrieve by Log Range")
+    now = datetime.utcnow()
+    log_filter = LogRangeFilter(
+        column='log',
+        start_timestamp=(now - timedelta(minutes=5)).strftime('%Y-%m-%d_%H:%M:%S'),
+        end_timestamp=now.strftime('%Y-%m-%d_%H:%M:%S')
+    )
+    df_log = client.get_dataframe('test/transactions', filter_by=log_filter)
+    print("Retrieved by log range:")
+    print(df_log)
+
+if __name__ == '__main__':
+    test_dataframe_client()

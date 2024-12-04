@@ -22,7 +22,6 @@ def test_dataframe_client():
     print("Original DataFrame:")
     print(df)
 
-    '''
     # Test 1: Basic Upload with Date Partitioning
     print("\nTest 1: Upload with Date Partitioning")
     metadata = client.load_dataframe(
@@ -43,7 +42,6 @@ def test_dataframe_client():
         }
     )
     print("Upload metadata:", metadata)
-    '''
 
     # Test 3: Retrieve by Date Range
     print("\nTest 3: Retrieve by Date Range")
@@ -55,6 +53,13 @@ def test_dataframe_client():
     df_date = client.get_dataframe('test/transactions-multi', filter_by=date_filter)
     print("Retrieved by date range:")
     print(df_date)
+    assert df_date['transaction_date'].nunique() == 2  # 2024-01-04 and 2024-01-05
+
+    date_filter = DateRangeFilter(column='transaction_date')
+    df_date = client.get_dataframe('test/transactions-multi', filter_by=date_filter)
+    print("Retrieved by date range:")
+    print(df_date)
+    assert df_date['transaction_date'].nunique() == df['transaction_date'].nunique()
 
     # Test 4: Retrieve by ID
     print("\nTest 4: Retrieve by ID")
@@ -66,6 +71,7 @@ def test_dataframe_client():
     df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
     print("Retrieved by IDs:")
     print(df_id)
+    assert df_id['user_id'].nunique() == 3
 
     # Or single ID (still works)
     id_filter = IdFilter(
@@ -75,6 +81,17 @@ def test_dataframe_client():
     df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
     print("Retrieved by ID:")
     print(df_id)
+    assert df_id['user_id'].nunique() == 1
+
+    # or all
+    id_filter = IdFilter(column='user_id')
+    df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
+    print("Retrieved by ID:")
+    print(df_id)
+    assert  df_id['user_id'].nunique() == df['user_id'].nunique()
+
+# TODO me falta implementar el get version control (last) y todo lo que haya
+    client.get_dataframe('test/transactions/', )
 
     # Test 5: Get Available Dates
     print("\nTest 5: List Available Dates")

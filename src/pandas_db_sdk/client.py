@@ -400,3 +400,49 @@ class DataFrameClient:
         except requests.exceptions.RequestException as e:
             error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
             raise APIError(f"Error getting log timestamps: {error}")
+
+    def get_chunk_ranges(
+            self,
+            dataframe_name: str,
+            filter_by: Optional[Union[DateRangeFilter, LogRangeFilter, IdFilter]] = None,
+            max_size_mb: int = 5
+    ) -> List[Tuple[int, int]]:
+        """
+        Get chunk ranges for a dataframe that can be used for parallel processing.
+
+        Args:
+            dataframe_name: Name of the dataframe to get chunk ranges for
+            filter_by: Optional filter to apply (only DateRangeFilter is supported)
+            max_size_mb: Maximum size of each chunk in MB
+
+        Returns:
+            List of tuples containing (start_index, end_index) for each chunk
+
+        Raises:
+            APIError: If the request fails
+            ValueError: If an unsupported filter type is provided
+        """
+        self._refresh_token_if_needed()
+        encoded_name = quote(dataframe_name, safe='')
+
+        params = {'max_size_mb': str(max_size_mb)}
+
+        # Only DateRangeFilter is supported based on the lambda implementation
+        if filter_by:
+            if not isinstance(filter_by, DateRangeFilter):
+                raise ValueError("Only DateRangeFilter is supported for chunk ranges")
+
+            params.update(filter_by.to_filter_params())
+
+        try:
+            response = requests.get(
+                f"{self.api_url}/dataframeChunksSize/{encoded_name}",
+                headers=self.headers,
+                params=params
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.RequestException as e:
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error retrieving chunk ranges: {error}")

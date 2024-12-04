@@ -90,30 +90,54 @@ def test_dataframe_client():
     print(df_id)
     assert  df_id['user_id'].nunique() == df['user_id'].nunique()
 
+    # Test 10 Get chunks ranges
+    chunks = client.get_chunk_ranges("test/transactions-multi")
+    assert not chunks
+
+    # Get chunks with date filter
+    date_filter = DateRangeFilter(
+        column="transaction_date",
+        start_date="2024-01-01",
+        end_date="2024-12-31"
+    )
+    chunks = client.get_chunk_ranges("test/transactions-multi", filter_by=date_filter)
+
 # TODO me falta implementar el get version control (last) y todo lo que haya
     client.get_dataframe('test/transactions/', )
 
+# TODO ya esta en server, pending en Client
     # Test 5: Get Available Dates
     print("\nTest 5: List Available Dates")
     dates = client.get_available_dates('test/transactions', 'transaction_date')
     print("Available dates:", dates)
 
-    # Test 6: Get Log Timestamps
-    print("\nTest 6: List Log Timestamps")
-    timestamps = client.get_log_timestamps('test/transactions')
-    print("Log timestamps:", timestamps)
-
-    # Test 7: Retrieve by Log Range
-    print("\nTest 7: Retrieve by Log Range")
-    now = datetime.utcnow()
-    log_filter = LogRangeFilter(
-        column='log',
-        start_timestamp=(now - timedelta(minutes=5)).strftime('%Y-%m-%d_%H:%M:%S'),
-        end_timestamp=now.strftime('%Y-%m-%d_%H:%M:%S')
+    # Test 6: Large dataframe. This one is:
+    #  Almost 16MB size
+    #  Also a large number of files: if stored by Date it will create more than 1000 files
+    size = 2 * 10 ** 5
+    dates = int(size / 1000) * pd.date_range(start='2024-01-01', periods=1000).to_list()
+    df = pd.DataFrame({
+        'transaction_date': dates,
+        'user_id': range(0, size),
+        'amount': [100] * size,
+        'category': ['A'] * size,
+    })
+    metadata = client.load_dataframe(
+        df=df,
+        dataframe_name='test/large',
+        columns_keys={
+            'transaction_date': 'Date',
+            'user_id': 'ID'
+        }
     )
-    df_log = client.get_dataframe('test/transactions', filter_by=log_filter)
-    print("Retrieved by log range:")
-    print(df_log)
+    print("Upload metadata:", metadata)
+
+    date_filter = DateRangeFilter(column='transaction_date')
+    df_large = client.get_dataframe('test/large', filter_by=date_filter)
+    print("Retrieved by date range:")
+    print(df_date)
+    assert len(df_large) == size
+
 
 if __name__ == '__main__':
     test_dataframe_client()

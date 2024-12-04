@@ -79,14 +79,22 @@ class LogRangeFilter:
 @dataclass
 class IdFilter:
     column: str
-    value: Optional[str] = None
+    values: Union[List[Union[int, str]], Union[int, str]] = None
     partition_type: str = 'id'
 
-    def to_filter_params(self) -> Dict[str, str]:
+    def __post_init__(self):
+        # Convert single value to list for consistent handling
+        if self.values is not None and not isinstance(self.values, list):
+            self.values = [self.values]
+        # Convert all values to float for consistent comparison
+        if self.values:
+            self.values = [float(v) for v in self.values]
+
+    def to_filter_params(self) -> Dict[str, Any]:
         return {
             'partition_type': self.partition_type,
-            'column': self.column,  # Changed from external_key to column
-            'partition_value': self.value
+            'column': self.column,
+            'values': json.dumps(self.values) if self.values else None
         }
 
 
@@ -159,24 +167,49 @@ class DataFrameClient:
 
         params = {'use_last': str(use_last).lower()}
 
-        if filter_by:
-            params.update(filter_by.to_filter_params())
+        if not filter_by:
+            return self._get_single_request(encoded_name, params)
+
+        params.update(filter_by.to_filter_params())
 
         try:
-            response = requests.get(
-                f"{self.api_url}/dataframes/get/{encoded_name}",
-                headers=self.headers,
-                params=params
-            )
-            response.raise_for_status()
-            df = pd.DataFrame(response.json())
+            if isinstance(filter_by, IdFilter) and filter_by.values:
+                # Get all relevant partitions and filter
+                all_dfs = []
+                response = requests.get(
+                    f"{self.api_url}/dataframes/get/{encoded_name}",
+                    headers=self.headers,
+                    params=params
+                )
+                response.raise_for_status()
+                df = pd.DataFrame(response.json())
 
-            # Apply client-side filtering if needed
-            if len(df) > 0 and filter_by:
-                if isinstance(filter_by, IdFilter) and filter_by.value is not None:
-                    df = df[df[filter_by.column] == float(filter_by.value)]
+                if len(df) > 0:
+                    # Filter rows where ID is in the requested values
+                    df = df[df[filter_by.column].isin(filter_by.values)]
+                    all_dfs.append(df)
 
-            return df
+                return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+
+            else:
+                # Handle date and log filters as before
+                response = requests.get(
+                    f"{self.api_url}/dataframes/get/{encoded_name}",
+                    headers=self.headers,
+                    params=params
+                )
+                response.raise_for_status()
+                df = pd.DataFrame(response.json())
+
+                if len(df) > 0:
+                    if isinstance(filter_by, DateRangeFilter) and filter_by.start_date and filter_by.end_date:
+                        df[filter_by.column] = pd.to_datetime(df[filter_by.column])
+                        mask = (df[filter_by.column] >= filter_by.start_date) & (
+                                    df[filter_by.column] <= filter_by.end_date)
+                        df = df[mask]
+
+                return df
+
         except requests.exceptions.RequestException as e:
             error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
             raise APIError(f"Error retrieving DataFrame: {error}")

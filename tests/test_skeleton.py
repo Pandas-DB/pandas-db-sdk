@@ -58,9 +58,19 @@ def test_dataframe_client():
 
     # Test 4: Retrieve by ID
     print("\nTest 4: Retrieve by ID")
+    # Get multiple specific IDs
     id_filter = IdFilter(
         column='user_id',
-        value='1002'
+        values=[1001, 1002, 1004]
+    )
+    df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
+    print("Retrieved by IDs:")
+    print(df_id)
+
+    # Or single ID (still works)
+    id_filter = IdFilter(
+        column='user_id',
+        values=1002
     )
     df_id = client.get_dataframe('test/transactions-multi', filter_by=id_filter)
     print("Retrieved by ID:")

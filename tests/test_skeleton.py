@@ -101,15 +101,15 @@ def test_dataframe_client():
         end_date="2024-12-31"
     )
     chunks = client.get_chunk_ranges("test/transactions-multi", filter_by=date_filter)
+    assert chunks
+
+    # Test 11: Get Available Dates
+    dates = client.list_dates("test/transactions-multi", "transaction_date")
+    print("Available dates:", dates)
+    assert dates
 
 # TODO me falta implementar el get version control (last) y todo lo que haya
     client.get_dataframe('test/transactions/', )
-
-# TODO ya esta en server, pending en Client
-    # Test 5: Get Available Dates
-    print("\nTest 5: List Available Dates")
-    dates = client.get_available_dates('test/transactions', 'transaction_date')
-    print("Available dates:", dates)
 
     # Test 6: Large dataframe. This one is:
     #  Almost 16MB size

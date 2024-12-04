@@ -446,3 +446,37 @@ class DataFrameClient:
         except requests.exceptions.RequestException as e:
             error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
             raise APIError(f"Error retrieving chunk ranges: {error}")
+
+    def list_dates(self, dataframe_name: str, column: str) -> List[str]:
+        """
+        List available dates for a specific column in a dataframe.
+
+        Args:
+            dataframe_name: Name of the dataframe to get dates for
+            column: Name of the column to get dates for
+
+        Returns:
+            List of dates available for the specified column
+
+        Raises:
+            APIError: If the request fails
+            ValueError: If column parameter is missing
+        """
+        self._refresh_token_if_needed()
+        encoded_name = quote(dataframe_name, safe='')
+
+        if not column:
+            raise ValueError("Column parameter is required")
+
+        try:
+            response = requests.get(
+                f"{self.api_url}/dataframesDates/{encoded_name}",
+                headers=self.headers,
+                params={'list': 'dates', 'column': column}
+            )
+            response.raise_for_status()
+            return response.json()['dates']
+
+        except requests.exceptions.RequestException as e:
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error listing dates: {error}")

@@ -1,114 +1,21 @@
 from concurrent.futures import ThreadPoolExecutor
-import sys
-from math import ceil
-from typing import Dict, Optional, Any, Union, List, Tuple
-from dataclasses import dataclass
-import requests
-import boto3
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import json
 from urllib.parse import quote
+import pandas as pd
+import boto3
+import requests
+from typing import Dict, Optional, Any, Union, List, Tuple
+import json
 
-
-# TODO this can go to an aux.py
-def convert_numpy_types(value):
-    """Convert numpy types to native Python types"""
-    import numpy as np
-    if isinstance(value, (np.int_, np.intc, np.intp, np.int8,
-                          np.int16, np.int32, np.int64, np.uint8, np.uint16,
-                          np.uint32, np.uint64)):
-        return int(value)
-    elif isinstance(value, (np.float_, np.float16, np.float32, np.float64)):
-        return float(value)
-    elif isinstance(value, (np.bool_)):
-        return bool(value)
-    elif isinstance(value, (np.ndarray,)):
-        return value.tolist()
-    return value
-
-
-class DataFrameClientError(Exception): pass
-
-
-class AuthenticationError(DataFrameClientError): pass
-
-
-class APIError(DataFrameClientError): pass
-
-
-@dataclass
-class Filter:
-    column: str
-    partition_type: str
-    value: Optional[str] = None
-
-
-@dataclass
-class DateRangeFilter:
-    column: str
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    partition_type: str = 'date'
-    value: Optional[str] = None
-
-    def to_filter_params(self) -> Dict[str, str]:
-        params = {
-            'partition_type': self.partition_type,
-            'column': self.column
-        }
-        # Only include dates in params if they are specified
-        if self.start_date is not None:
-            params['start_date'] = self.start_date
-        if self.end_date is not None:
-            params['end_date'] = self.end_date
-        return params
-
-
-@dataclass
-class LogRangeFilter:
-    column: str
-    start_timestamp: str
-    end_timestamp: str
-    partition_type: str = 'log'
-    value: Optional[str] = None
-
-    def to_filter_params(self) -> Dict[str, str]:
-        return {
-            'partition_type': self.partition_type,
-            'column': self.column,  # Changed from external_key to column
-            'start_timestamp': self.start_timestamp,
-            'end_timestamp': self.end_timestamp
-        }
-
-
-@dataclass
-class IdFilter:
-    column: str
-    values: Union[List[Union[int, str]], Union[int, str]] = None
-    partition_type: str = 'id'
-
-    def __post_init__(self):
-        # Convert single value to list for consistent handling
-        if self.values is not None and not isinstance(self.values, list):
-            self.values = [self.values]
-        # Convert all values to float for consistent comparison
-        if self.values:
-            self.values = [float(v) for v in self.values]
-
-    def to_filter_params(self) -> Dict[str, Any]:
-        return {
-            'partition_type': self.partition_type,
-            'column': self.column,
-            'values': json.dumps(self.values) if self.values else None
-        }
-
-
-@dataclass
-class PaginationInfo:
-    page_size: int = 100  # Number of chunks to process per request
-    page_token: Optional[str] = None  # Token for next page
+from .models import (
+    DataFrameClientError,
+    AuthenticationError,
+    APIError,
+    DateRangeFilter,
+    LogRangeFilter,
+    IdFilter
+)
+from .auth import AuthManager
+from .utils import convert_numpy_types
 
 
 class DataFrameClient:
@@ -174,25 +81,74 @@ class DataFrameClient:
             dataframe_name: str,
             filter_by: Optional[Union[DateRangeFilter, LogRangeFilter, IdFilter]] = None,
             use_last: bool = False,
-            pagination: Optional[PaginationInfo] = None
+            max_workers: int = 10
     ) -> pd.DataFrame:
         """
-        Get DataFrame with pagination support
+        Get DataFrame using chunk ranges for efficient parallel retrieval
         """
         self._refresh_token_if_needed()
         encoded_name = quote(dataframe_name, safe='')
 
-        params = {'use_last': str(use_last).lower()}
+        # 1. Get chunk ranges first
+        try:
+            ranges = self.get_chunk_ranges(dataframe_name, filter_by)
+            if not ranges:
+                return pd.DataFrame()
+        except Exception as e:
+            raise APIError(f"Error getting chunk ranges: {str(e)}")
 
-        if filter_by:
-            params.update(filter_by.to_filter_params())
+        # 2. Retrieve chunks in parallel
+        dfs = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Prepare parameters for each range
+            futures = []
+            for start_idx, end_idx in ranges:
+                params = {'use_last': str(use_last).lower()}
+                params.update({'chunk_range': json.dumps([start_idx, end_idx])})
+                if filter_by:
+                    params.update(filter_by.to_filter_params())
 
-        if pagination:
-            params.update({
-                'page_size': str(pagination.page_size),
-                'page_token': pagination.page_token
-            })
+                futures.append(
+                    executor.submit(
+                        self._get_chunk,
+                        encoded_name,
+                        params
+                    )
+                )
 
+            # Collect results maintaining order
+            for future in futures:
+                try:
+                    chunk_df = future.result()
+                    if len(chunk_df) > 0:
+                        dfs.append(chunk_df)
+                except Exception as e:
+                    # Cancel remaining futures if one fails
+                    for f in futures:
+                        f.cancel()
+                    raise APIError(f"Error retrieving DataFrame chunk: {str(e)}")
+
+        # Combine all chunks
+        if not dfs:
+            return pd.DataFrame()
+
+        result_df = pd.concat(dfs, ignore_index=True)
+
+        # Apply any client-side filtering if needed
+        if len(result_df) > 0:
+            if isinstance(filter_by, DateRangeFilter):
+                result_df[filter_by.column] = pd.to_datetime(result_df[filter_by.column])
+                if filter_by.start_date and filter_by.end_date:
+                    mask = (result_df[filter_by.column] >= filter_by.start_date) & \
+                           (result_df[filter_by.column] <= filter_by.end_date)
+                    result_df = result_df[mask]
+            elif isinstance(filter_by, IdFilter) and filter_by.values:
+                result_df = result_df[result_df[filter_by.column].isin(filter_by.values)]
+
+        return result_df
+
+    def _get_chunk(self, encoded_name: str, params: Dict[str, Any]) -> pd.DataFrame:
+        """Helper method to retrieve a single chunk"""
         try:
             response = requests.get(
                 f"{self.api_url}/dataframes/get/{encoded_name}",
@@ -201,30 +157,21 @@ class DataFrameClient:
             )
             response.raise_for_status()
             data = response.json()
-
-            df = pd.DataFrame(data)
-
-            if len(df) > 0:
-                # Handle date columns
-                if isinstance(filter_by, DateRangeFilter):
-                    df[filter_by.column] = pd.to_datetime(df[filter_by.column])
-
-                # Apply client-side filtering if needed
-                if isinstance(filter_by, IdFilter) and filter_by.values:
-                    df = df[df[filter_by.column].isin(filter_by.values)]
-                elif isinstance(filter_by, DateRangeFilter) and filter_by.start_date and filter_by.end_date:
-                    mask = (df[filter_by.column] >= filter_by.start_date) & (df[filter_by.column] <= filter_by.end_date)
-                    df = df[mask]
-
-            return df
-
+            return pd.DataFrame(data)
         except requests.exceptions.RequestException as e:
             error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error retrieving DataFrame: {error}")
+            raise APIError(f"Error retrieving DataFrame chunk: {error}")
 
     def _get_dataframe_size_mb(self, df: pd.DataFrame) -> float:
-        """Calculate DataFrame size in MB"""
-        return sys.getsizeof(df.to_json(orient='records')) / (1024 * 1024)
+        """Calculate DataFrame size in MB more accurately"""
+        # Convert to JSON the same way we'll send it
+        records = df.to_dict(orient='records')
+        for record in records:
+            for key, value in record.items():
+                record[key] = convert_numpy_types(value)
+
+        json_data = json.dumps(records)
+        return len(json_data.encode('utf-8')) / (1024 * 1024)
 
     def _split_dataframe(self, df: pd.DataFrame, chunk_size_mb: float = 5.0) -> List[pd.DataFrame]:
         """Split DataFrame into chunks of approximately chunk_size_mb"""
@@ -232,11 +179,22 @@ class DataFrameClient:
         if total_size_mb <= chunk_size_mb:
             return [df]
 
-        # Calculate number of rows per chunk based on average row size
-        avg_row_size_mb = total_size_mb / len(df)
-        rows_per_chunk = int(chunk_size_mb / avg_row_size_mb)
+        # Calculate approximate number of rows per chunk
+        # Use a safety factor of 0.8 to account for metadata overhead
+        safe_chunk_size_mb = chunk_size_mb * 0.8
+        rows_per_chunk = max(1, int((safe_chunk_size_mb / total_size_mb) * len(df)))
 
-        return [df[i:i + rows_per_chunk] for i in range(0, len(df), rows_per_chunk)]
+        chunks = []
+        for i in range(0, len(df), rows_per_chunk):
+            chunk = df[i:i + rows_per_chunk]
+            # Verify chunk size and adjust if needed
+            while self._get_dataframe_size_mb(chunk) > safe_chunk_size_mb and len(chunk) > 1:
+                # Reduce chunk size by 10% if it's still too large
+                rows_per_chunk = max(1, int(rows_per_chunk * 0.9))
+                chunk = df[i:i + rows_per_chunk]
+            chunks.append(chunk)
+
+        return chunks
 
     def _upload_chunk(
             self,
@@ -299,7 +257,7 @@ class DataFrameClient:
             columns_keys: Optional[Dict[str, str]] = None,
             storage_method: str = 'concat',
             max_workers: int = 10,
-            chunk_size_mb: float = 5.0
+            chunk_size_mb: float = 4.5
     ) -> Dict:
         """
         Upload DataFrame with automatic chunking and parallel processing for 'concat' storage method.
@@ -321,7 +279,8 @@ class DataFrameClient:
         elif not isinstance(df, pd.DataFrame):
             raise ValueError("df must be DataFrame, JSON string, or dictionary")
 
-        # Validate columns
+        # Handle timestamp columns before any processing
+        date_columns = []
         if columns_keys:
             for col, key_type in columns_keys.items():
                 if col in {'log', 'default'}:
@@ -330,28 +289,66 @@ class DataFrameClient:
                     raise ValueError(f"Invalid key type: {key_type}")
                 if col not in df.columns:
                     raise ValueError(f"Column not found: {col}")
+                if key_type == 'Date':
+                    df[col] = pd.to_datetime(df[col])
+                    date_columns.append(col)
+
+        # Create a copy to avoid modifying the original DataFrame
+        df_copy = df.copy()
+
+        # Convert timestamps to string format
+        for col in df_copy.select_dtypes(include=['datetime64[ns]']).columns:
+            df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d')
+
+        # Convert numeric columns to Python native types
+        for col in df_copy.select_dtypes(include=['integer', 'floating']).columns:
+            df_copy[col] = df_copy[col].map(convert_numpy_types)
 
         # If not using concat or DataFrame is small, use regular upload
-        if storage_method != 'concat' or self._get_dataframe_size_mb(df) <= chunk_size_mb:
-            return self._upload_chunk(df, dataframe_name, 0, 1, columns_keys, storage_method)
+        if storage_method != 'concat' or self._get_dataframe_size_mb(df_copy) <= chunk_size_mb:
+            return self._upload_chunk(df_copy, dataframe_name, 0, 1, columns_keys, storage_method)
 
         # Split DataFrame into chunks
-        chunks = self._split_dataframe(df, chunk_size_mb)
+        chunks = []
+        total_size_mb = self._get_dataframe_size_mb(df_copy)
+        rows_per_chunk = max(1, int((chunk_size_mb / total_size_mb) * len(df_copy)))
+
+        for i in range(0, len(df_copy), rows_per_chunk):
+            chunk = df_copy[i:i + rows_per_chunk]
+            # Verify chunk size and adjust if needed
+            while self._get_dataframe_size_mb(chunk) > chunk_size_mb and len(chunk) > 1:
+                # Reduce chunk size by 10% if it's still too large
+                rows_per_chunk = max(1, int(rows_per_chunk * 0.9))
+                chunk = df_copy[i:i + rows_per_chunk]
+            chunks.append(chunk)
+
         total_chunks = len(chunks)
 
         # Upload chunks in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for i, chunk in enumerate(chunks):
+                # Convert chunk to records and handle numpy types
+                records = chunk.to_dict(orient='records')
+                for record in records:
+                    for key, value in record.items():
+                        record[key] = convert_numpy_types(value)
+
+                # Create chunk info
+                chunk_info = {
+                    'dataframe': json.dumps(records),
+                    'dataframe_name': dataframe_name,
+                    'columns_keys': columns_keys or {},
+                    'storage_method': storage_method,
+                    'chunk_index': i,
+                    'total_chunks': total_chunks
+                }
+
+                # Submit chunk upload task
                 futures.append(
                     executor.submit(
-                        self._upload_chunk,
-                        chunk,
-                        dataframe_name,
-                        i,
-                        total_chunks,
-                        columns_keys,
-                        storage_method
+                        self._make_upload_request,
+                        chunk_info
                     )
                 )
 
@@ -427,10 +424,9 @@ class DataFrameClient:
 
         params = {'max_size_mb': str(max_size_mb)}
 
-        # Only DateRangeFilter is supported based on the lambda implementation
         if filter_by:
-            if not isinstance(filter_by, DateRangeFilter):
-                raise ValueError("Only DateRangeFilter is supported for chunk ranges")
+            if not isinstance(filter_by, (DateRangeFilter, IdFilter)):
+                raise ValueError("Only DateRangeFilter and IdFilter are supported for chunk ranges")
 
             params.update(filter_by.to_filter_params())
 
@@ -480,3 +476,18 @@ class DataFrameClient:
         except requests.exceptions.RequestException as e:
             error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
             raise APIError(f"Error listing dates: {error}")
+
+    def _make_upload_request(self, chunk_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Helper method to make the actual upload request"""
+        try:
+            response = requests.post(
+                f"{self.api_url}/dataframes/upload",
+                headers=self.headers,
+                json=chunk_info
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.RequestException as e:
+            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
+            raise APIError(f"Error uploading chunk {chunk_info['chunk_index']}: {error}")

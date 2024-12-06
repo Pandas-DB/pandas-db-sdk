@@ -74,6 +74,15 @@ def test_post_dataframe(client):
 
 
 def test_get_dataframe(client):
+    # Take small dataframe
+    print('... Retrieve small dataframe')
+    start_time = time.time()
+    # Single file query
+    df = client.get_dataframe('testZ/small-file')
+    print(f"Retrieved {len(df)} rows | "
+          f"In: {round(time.time() - start_time, 2)} seconds | "
+          f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
+    assert not df.empty
 
     print('... Retrieve large dataframe with query')
     start_time = time.time()
@@ -83,29 +92,21 @@ def test_get_dataframe(client):
         query="SELECT * FROM s3object WHERE transaction_date = '2024-01-01'",
     )
     print(f"Retrieved {len(df)} rows | "
-          f"In: {time.time() - start_time} seconds | "
-          f"Avg performance: {len(df)} / {time.time() - start_time} rows retrieved per second")
+          f"In: {round(time.time() - start_time, 2)} seconds | "
+          f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
+# TODO no devuelve el df con los nombres de las columnas!!
     assert df['transaction_date'].unique().values == '2024-01-01'
 
+# TODO este falla
     # Take the whole large dataframe
     print('... Retrieve large dataframe')
     start_time = time.time()
     # Single file query
-    df = client.get_dataframe(key='testZ/large-file')
+    df = client.get_dataframe('testZ/large-file')
     print(f"Retrieved {len(df)} rows | "
-          f"In: {time.time() - start_time} seconds | "
-          f"Avg performance: {len(df)} / {time.time() - start_time} rows retrieved per second")
+          f"In: {round(time.time() - start_time, 2)} seconds | "
+          f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
     assert df == create_test_dataframe()
-
-    # Take small dataframe
-    print('... Retrieve small dataframe')
-    start_time = time.time()
-    # Single file query
-    df = client.get_dataframe(key='testZ/small-file')
-    print(f"Retrieved {len(df)} rows | "
-          f"In: {time.time() - start_time} seconds | "
-          f"Avg performance: {len(df)} / {time.time() - start_time} rows retrieved per second")
-    assert not df.empty
 
 
 def main():

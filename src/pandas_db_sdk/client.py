@@ -87,7 +87,7 @@ class DataFrameClient:
             query: Optional[str] = None,
             retries: int = 3,
             retry_delay: int = 1,
-            timeout: int = 30,
+            timeout: int = 30000,
             chunk_size: Optional[int] = None
     ) -> pd.DataFrame:
         """
@@ -149,7 +149,7 @@ class DataFrameClient:
                         df = pd.concat(chunks, ignore_index=True)
                     else:
                         # Small files
-                        df = pd.read_csv(download_url, timeout=timeout)
+                        df = pd.read_csv(download_url)
 
                     logger.info(f"Successfully downloaded data: {len(df)} rows")
                     return df
@@ -221,7 +221,7 @@ class DataFrameClient:
             # Upload parts
             for part_number in range(1, math.ceil(total_size / chunk_size) + 1):
                 complete_response = self._make_request(
-                    'POST',  # Note: Changed from POST to PUT to match server
+                    'POST',
                     url,
                     json={
                         'part_number': part_number,
@@ -262,7 +262,7 @@ class DataFrameClient:
 
             # Complete multipart upload
             complete_response = self._make_request(
-                'POST',  # Note: Changed from POST to PUT to match server
+                'POST',
                 url,
                 json={
                     'parts': parts,

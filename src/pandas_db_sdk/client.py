@@ -1,41 +1,28 @@
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
+from io import StringIO
 import pandas as pd
 import boto3
 import requests
-from typing import Dict, Optional, Any, Union, List, Tuple
+from requests.exceptions import RequestException
+from typing import Dict, Optional, Any
 import json
+import time
+import math
+import logging
 
 from .models import (
     DataFrameClientError,
+    S3SelectClientError,
     AuthenticationError,
     APIError,
-    DateRangeFilter,
-    LogRangeFilter,
-    IdFilter
 )
 from .auth import AuthManager
 from .utils import convert_numpy_types
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 
 class DataFrameClient:
-    @staticmethod
-    def get_auth_token(api_url: str, user: str, password: str, region: str = 'eu-west-1') -> str:
-        api_url = api_url.rstrip('/')
-        try:
-            response = requests.get(f"{api_url}/auth/config")
-            response.raise_for_status()
-            client_id = response.json()['userPoolClientId']
-
-            cognito = boto3.client('cognito-idp', region_name=region)
-            auth = cognito.initiate_auth(
-                ClientId=client_id,
-                AuthFlow='USER_PASSWORD_AUTH',
-                AuthParameters={'USERNAME': user, 'PASSWORD': password}
-            )
-            return auth['AuthenticationResult']['IdToken']
-        except Exception as e:
-            raise AuthenticationError(f"Authentication failed: {str(e)}")
 
     def __init__(
             self,
@@ -63,6 +50,24 @@ class DataFrameClient:
             'Content-Type': 'application/json'
         }
 
+    @staticmethod
+    def get_auth_token(api_url: str, user: str, password: str, region: str = 'eu-west-1') -> str:
+        api_url = api_url.rstrip('/')
+        try:
+            response = requests.get(f"{api_url}/auth/config")
+            response.raise_for_status()
+            client_id = response.json()['userPoolClientId']
+
+            cognito = boto3.client('cognito-idp', region_name=region)
+            auth = cognito.initiate_auth(
+                ClientId=client_id,
+                AuthFlow='USER_PASSWORD_AUTH',
+                AuthParameters={'USERNAME': user, 'PASSWORD': password}
+            )
+            return auth['AuthenticationResult']['IdToken']
+        except Exception as e:
+            raise AuthenticationError(f"Authentication failed: {str(e)}")
+
     def _refresh_token_if_needed(self) -> None:
         try:
             response = requests.get(f"{self.api_url}/auth/verify", headers=self.headers)
@@ -79,415 +84,225 @@ class DataFrameClient:
     def get_dataframe(
             self,
             dataframe_name: str,
-            filter_by: Optional[Union[DateRangeFilter, LogRangeFilter, IdFilter]] = None,
-            use_last: bool = False,
-            max_workers: int = 10
+            query: Optional[str] = None,
+            retries: int = 3,
+            retry_delay: int = 1,
+            timeout: int = 30,
+            chunk_size: Optional[int] = None
     ) -> pd.DataFrame:
         """
-        Get DataFrame using chunk ranges for efficient parallel retrieval
-        """
-        self._refresh_token_if_needed()
-        encoded_name = quote(dataframe_name, safe='')
+        Query S3 data using S3 Select and return as DataFrame
 
-        # 1. Get chunk ranges first
+        Args:
+            dataframe_name: S3 key/path of the source file
+            query: Optional S3 Select SQL query (default: SELECT * FROM s3object)
+            retries: Number of download retries
+            retry_delay: Seconds to wait between retries
+            timeout: Request timeout in seconds
+            chunk_size: Optional chunk size for reading large files
+
+        Returns:
+            pandas.DataFrame with query results
+        """
         try:
-            ranges = self.get_chunk_ranges(dataframe_name, filter_by)
-            if not ranges:
-                return pd.DataFrame()
+            self._refresh_token_if_needed()
+
+            # Prepare query parameters
+            params = {}
+            if query:
+                params['query'] = query
+                logger.info(f"Query: {query} for {dataframe_name}")
+
+            # URL encode the key for path parameters while preserving slashes
+            encoded_key = requests.utils.quote(dataframe_name, safe='')
+
+            # Get pre-signed URL with retries
+            for attempt in range(retries):
+                try:
+                    response = requests.get(
+                        f"{self.api_url}/dataframes/{encoded_key}/get",
+                        params=params,
+                        headers=self.headers,  # Include authorization headers
+                        timeout=timeout
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    download_url = data['download_url']
+                    logger.info("Successfully obtained pre-signed URL")
+                    break
+                except requests.exceptions.RequestException as e:
+                    if attempt == retries - 1:
+                        raise APIError(f"Failed to get pre-signed URL: {str(e)}")
+                    logger.warning(f"Attempt {attempt + 1} failed, retrying...")
+                    time.sleep(retry_delay * (2 ** attempt))
+
+            # Download data with retries
+            for attempt in range(retries):
+                try:
+                    if chunk_size:
+                        # Stream large files
+                        chunks = []
+                        with requests.get(download_url, stream=True, timeout=timeout) as r:
+                            r.raise_for_status()
+                            for chunk in pd.read_csv(r.raw, chunksize=chunk_size):
+                                chunks.append(chunk)
+                        df = pd.concat(chunks, ignore_index=True)
+                    else:
+                        # Small files
+                        df = pd.read_csv(download_url, timeout=timeout)
+
+                    logger.info(f"Successfully downloaded data: {len(df)} rows")
+                    return df
+
+                except Exception as e:
+                    if attempt == retries - 1:
+                        raise APIError(f"Failed to download data: {str(e)}")
+                    logger.warning(f"Download attempt {attempt + 1} failed, retrying...")
+                    time.sleep(retry_delay * (2 ** attempt))
+
         except Exception as e:
-            raise APIError(f"Error getting chunk ranges: {str(e)}")
+            logger.error(f"Error in get_dataframe: {str(e)}")
+            raise
 
-        # 2. Retrieve chunks in parallel
-        dfs = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Prepare parameters for each range
-            futures = []
-            for start_idx, end_idx in ranges:
-                params = {'use_last': str(use_last).lower()}
-                params.update({'chunk_range': json.dumps([start_idx, end_idx])})
-                if filter_by:
-                    params.update(filter_by.to_filter_params())
-
-                futures.append(
-                    executor.submit(
-                        self._get_chunk,
-                        encoded_name,
-                        params
-                    )
-                )
-
-            # Collect results maintaining order
-            for future in futures:
-                try:
-                    chunk_df = future.result()
-                    if len(chunk_df) > 0:
-                        dfs.append(chunk_df)
-                except Exception as e:
-                    # Cancel remaining futures if one fails
-                    for f in futures:
-                        f.cancel()
-                    raise APIError(f"Error retrieving DataFrame chunk: {str(e)}")
-
-        # Combine all chunks
-        if not dfs:
-            return pd.DataFrame()
-
-        result_df = pd.concat(dfs, ignore_index=True)
-
-        # Apply any client-side filtering if needed
-        if len(result_df) > 0:
-            if isinstance(filter_by, DateRangeFilter):
-                result_df[filter_by.column] = pd.to_datetime(result_df[filter_by.column])
-                if filter_by.start_date and filter_by.end_date:
-                    mask = (result_df[filter_by.column] >= filter_by.start_date) & \
-                           (result_df[filter_by.column] <= filter_by.end_date)
-                    result_df = result_df[mask]
-            elif isinstance(filter_by, IdFilter) and filter_by.values:
-                result_df = result_df[result_df[filter_by.column].isin(filter_by.values)]
-
-        return result_df
-
-    def _get_chunk(self, encoded_name: str, params: Dict[str, Any]) -> pd.DataFrame:
-        """Helper method to retrieve a single chunk"""
-        try:
-            response = requests.get(
-                f"{self.api_url}/dataframes/get/{encoded_name}",
-                headers=self.headers,
-                params=params
-            )
-            response.raise_for_status()
-            data = response.json()
-            return pd.DataFrame(data)
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error retrieving DataFrame chunk: {error}")
-
-    def _get_dataframe_size_mb(self, df: pd.DataFrame) -> float:
-        """Calculate DataFrame size in MB more accurately"""
-        # Convert to JSON the same way we'll send it
-        records = df.to_dict(orient='records')
-        for record in records:
-            for key, value in record.items():
-                record[key] = convert_numpy_types(value)
-
-        json_data = json.dumps(records)
-        return len(json_data.encode('utf-8')) / (1024 * 1024)
-
-    def _split_dataframe(self, df: pd.DataFrame, chunk_size_mb: float = 5.0) -> List[pd.DataFrame]:
-        """Split DataFrame into chunks of approximately chunk_size_mb"""
-        total_size_mb = self._get_dataframe_size_mb(df)
-        if total_size_mb <= chunk_size_mb:
-            return [df]
-
-        # Calculate approximate number of rows per chunk
-        # Use a safety factor of 0.8 to account for metadata overhead
-        safe_chunk_size_mb = chunk_size_mb * 0.8
-        rows_per_chunk = max(1, int((safe_chunk_size_mb / total_size_mb) * len(df)))
-
-        chunks = []
-        for i in range(0, len(df), rows_per_chunk):
-            chunk = df[i:i + rows_per_chunk]
-            # Verify chunk size and adjust if needed
-            while self._get_dataframe_size_mb(chunk) > safe_chunk_size_mb and len(chunk) > 1:
-                # Reduce chunk size by 10% if it's still too large
-                rows_per_chunk = max(1, int(rows_per_chunk * 0.9))
-                chunk = df[i:i + rows_per_chunk]
-            chunks.append(chunk)
-
-        return chunks
-
-    def _upload_chunk(
+    def post_dataframe(
             self,
-            df_chunk: pd.DataFrame,
+            df: pd.DataFrame,
             dataframe_name: str,
-            chunk_index: int,
-            total_chunks: int,
-            columns_keys: Optional[Dict[str, str]] = None,
-            storage_method: str = 'concat'
-    ) -> Dict:
-        """Upload a single chunk of the DataFrame"""
-        # Handle date columns
-        date_columns = []
-        if columns_keys:
-            for col, key_type in columns_keys.items():
-                if key_type == 'Date':
-                    df_chunk[col] = pd.to_datetime(df_chunk[col])
-                    date_columns.append(col)
-
-        df_copy = df_chunk.copy()
-
-        # Format date columns
-        for date_col in date_columns:
-            df_copy[date_col] = df_copy[date_col].dt.strftime('%Y-%m-%d')
-
-        # Convert to records and handle numpy types
-        records = df_copy.to_dict(orient='records')
-        for record in records:
-            for key, value in record.items():
-                record[key] = convert_numpy_types(value)
-
-        json_data = json.dumps(records)
-
-        # Add chunk information to the request
-        chunk_info = {
-            'dataframe': json_data,
-            'dataframe_name': dataframe_name,
-            'columns_keys': columns_keys or {},
-            'storage_method': storage_method,
-            'chunk_index': chunk_index,
-            'total_chunks': total_chunks
-        }
-
-        try:
-            response = requests.post(
-                f"{self.api_url}/dataframes/upload",
-                headers=self.headers,
-                json=chunk_info
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error uploading chunk {chunk_index}: {error}")
-
-    def load_dataframe(
-            self,
-            df: Union[pd.DataFrame, str, Dict],
-            dataframe_name: str,
-            columns_keys: Optional[Dict[str, str]] = None,
-            storage_method: str = 'concat',
-            max_workers: int = 10,
-            chunk_size_mb: float = 4.5
-    ) -> Dict:
+            chunk_size: int = 5 * 1024 * 1024,  # 5MB chunks
+            retries: int = 3,
+            retry_delay: int = 1,
+            timeout: int = 300
+    ) -> Dict[str, Any]:
         """
-        Upload DataFrame with automatic chunking and parallel processing for 'concat' storage method.
-        Args:
-            df: DataFrame to upload
-            dataframe_name: Name for the DataFrame
-            columns_keys: Column keys configuration
-            storage_method: Storage method ('concat' or other)
-            max_workers: Maximum number of concurrent upload threads
-            chunk_size_mb: Maximum size of each chunk in MB
-        """
-        self._refresh_token_if_needed()
-
-        # Input validation and conversion
-        if isinstance(df, str):
-            df = pd.read_json(df)
-        elif isinstance(df, dict):
-            df = pd.DataFrame.from_dict(df)
-        elif not isinstance(df, pd.DataFrame):
-            raise ValueError("df must be DataFrame, JSON string, or dictionary")
-
-        # Handle timestamp columns before any processing
-        date_columns = []
-        if columns_keys:
-            for col, key_type in columns_keys.items():
-                if col in {'log', 'default'}:
-                    raise ValueError(f"Column name '{col}' is reserved")
-                if key_type not in ['Date', 'ID']:
-                    raise ValueError(f"Invalid key type: {key_type}")
-                if col not in df.columns:
-                    raise ValueError(f"Column not found: {col}")
-                if key_type == 'Date':
-                    df[col] = pd.to_datetime(df[col])
-                    date_columns.append(col)
-
-        # Create a copy to avoid modifying the original DataFrame
-        df_copy = df.copy()
-
-        # Convert timestamps to string format
-        for col in df_copy.select_dtypes(include=['datetime64[ns]']).columns:
-            df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d')
-
-        # Convert numeric columns to Python native types
-        for col in df_copy.select_dtypes(include=['integer', 'floating']).columns:
-            df_copy[col] = df_copy[col].map(convert_numpy_types)
-
-        # If not using concat or DataFrame is small, use regular upload
-        if storage_method != 'concat' or self._get_dataframe_size_mb(df_copy) <= chunk_size_mb:
-            return self._upload_chunk(df_copy, dataframe_name, 0, 1, columns_keys, storage_method)
-
-        # Split DataFrame into chunks
-        chunks = []
-        total_size_mb = self._get_dataframe_size_mb(df_copy)
-        rows_per_chunk = max(1, int((chunk_size_mb / total_size_mb) * len(df_copy)))
-
-        for i in range(0, len(df_copy), rows_per_chunk):
-            chunk = df_copy[i:i + rows_per_chunk]
-            # Verify chunk size and adjust if needed
-            while self._get_dataframe_size_mb(chunk) > chunk_size_mb and len(chunk) > 1:
-                # Reduce chunk size by 10% if it's still too large
-                rows_per_chunk = max(1, int(rows_per_chunk * 0.9))
-                chunk = df_copy[i:i + rows_per_chunk]
-            chunks.append(chunk)
-
-        total_chunks = len(chunks)
-
-        # Upload chunks in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i, chunk in enumerate(chunks):
-                # Convert chunk to records and handle numpy types
-                records = chunk.to_dict(orient='records')
-                for record in records:
-                    for key, value in record.items():
-                        record[key] = convert_numpy_types(value)
-
-                # Create chunk info
-                chunk_info = {
-                    'dataframe': json.dumps(records),
-                    'dataframe_name': dataframe_name,
-                    'columns_keys': columns_keys or {},
-                    'storage_method': storage_method,
-                    'chunk_index': i,
-                    'total_chunks': total_chunks
-                }
-
-                # Submit chunk upload task
-                futures.append(
-                    executor.submit(
-                        self._make_upload_request,
-                        chunk_info
-                    )
-                )
-
-            # Wait for all uploads to complete and collect results
-            results = []
-            for future in futures:
-                try:
-                    results.append(future.result())
-                except Exception as e:
-                    # Cancel all pending futures if one fails
-                    for f in futures:
-                        f.cancel()
-                    raise e
-
-        # Return the last result (assuming server handles chunk merging)
-        return results[-1]
-
-    def get_available_dates(self, dataframe_name: str, date_column: str) -> List[str]:
-        self._refresh_token_if_needed()
-        encoded_name = quote(dataframe_name, safe='')
-
-        try:
-            response = requests.get(
-                f"{self.api_url}/dataframes/{encoded_name}",
-                headers=self.headers,
-                params={'list': 'dates', 'date_column': date_column}
-            )
-            response.raise_for_status()
-            return response.json()['dates']
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error getting available dates: {error}")
-
-    def get_log_timestamps(self, dataframe_name: str) -> List[str]:
-        self._refresh_token_if_needed()
-        encoded_name = quote(dataframe_name, safe='')
-
-        try:
-            response = requests.get(
-                f"{self.api_url}/dataframes/{encoded_name}",
-                headers=self.headers,
-                params={'list': 'timestamps'}
-            )
-            response.raise_for_status()
-            return response.json()['timestamps']
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error getting log timestamps: {error}")
-
-    def get_chunk_ranges(
-            self,
-            dataframe_name: str,
-            filter_by: Optional[Union[DateRangeFilter, LogRangeFilter, IdFilter]] = None,
-            max_size_mb: int = 5
-    ) -> List[Tuple[int, int]]:
-        """
-        Get chunk ranges for a dataframe that can be used for parallel processing.
+        Upload a DataFrame to S3 through the API using multipart upload
 
         Args:
-            dataframe_name: Name of the dataframe to get chunk ranges for
-            filter_by: Optional filter to apply (only DateRangeFilter is supported)
-            max_size_mb: Maximum size of each chunk in MB
+            df: pandas DataFrame to upload
+            dataframe_name: S3 dataframe_name/dataframe_id for the uploaded file
+            chunk_size: Size of upload chunks in bytes (default: 5MB)
+            retries: Number of upload retries
+            retry_delay: Seconds to wait between retries
+            timeout: Request timeout in seconds
 
         Returns:
-            List of tuples containing (start_index, end_index) for each chunk
-
-        Raises:
-            APIError: If the request fails
-            ValueError: If an unsupported filter type is provided
+            Dict with upload results containing dataframe_name info
         """
-        self._refresh_token_if_needed()
-        encoded_name = quote(dataframe_name, safe='')
-
-        params = {'max_size_mb': str(max_size_mb)}
-
-        if filter_by:
-            if not isinstance(filter_by, (DateRangeFilter, IdFilter)):
-                raise ValueError("Only DateRangeFilter and IdFilter are supported for chunk ranges")
-
-            params.update(filter_by.to_filter_params())
-
         try:
-            response = requests.get(
-                f"{self.api_url}/dataframeChunksSize/{encoded_name}",
-                headers=self.headers,
-                params=params
+            self._refresh_token_if_needed()
+
+            if df.empty:
+                raise DataFrameClientError("DataFrame is empty")
+
+            # URL encode the key for path parameters while preserving slashes
+            encoded_key = requests.utils.quote(dataframe_name, safe='')
+
+            url = f"{self.api_url}/dataframes/{encoded_key}/upload"
+
+            # Initialize multipart upload
+            response = self._make_request(
+                'POST',
+                url,
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay
             )
-            response.raise_for_status()
-            return response.json()
+            upload_id = response['upload_id']
 
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error retrieving chunk ranges: {error}")
+            # Convert DataFrame to CSV data
+            csv_buffer = StringIO()
+            df.to_csv(csv_buffer, index=False)
+            csv_buffer.seek(0)
+            csv_data = csv_buffer.getvalue().encode('utf-8')
 
-    def list_dates(self, dataframe_name: str, column: str) -> List[str]:
-        """
-        List available dates for a specific column in a dataframe.
+            # Calculate parts
+            total_size = len(csv_data)
+            parts = []
 
-        Args:
-            dataframe_name: Name of the dataframe to get dates for
-            column: Name of the column to get dates for
+            # Upload parts
+            for part_number in range(1, math.ceil(total_size / chunk_size) + 1):
+                complete_response = self._make_request(
+                    'POST',  # Note: Changed from POST to PUT to match server
+                    url,
+                    json={
+                        'part_number': part_number,
+                        'upload_id': upload_id,
+                    },
+                    timeout=timeout,
+                    retries=retries,
+                    retry_delay=retry_delay
+                )
+                part_url = complete_response['upload_url']
 
-        Returns:
-            List of dates available for the specified column
+                # Upload the part
+                start_pos = (part_number - 1) * chunk_size
+                end_pos = min(start_pos + chunk_size, total_size)
+                part_data = csv_data[start_pos:end_pos]
 
-        Raises:
-            APIError: If the request fails
-            ValueError: If column parameter is missing
-        """
-        self._refresh_token_if_needed()
-        encoded_name = quote(dataframe_name, safe='')
+                for attempt in range(retries):
+                    try:
+                        part_response = requests.put(
+                            part_url,
+                            data=part_data,
+                            timeout=timeout
+                        )
+                        part_response.raise_for_status()
 
-        if not column:
-            raise ValueError("Column parameter is required")
+                        parts.append({
+                            'PartNumber': part_number,
+                            'ETag': part_response.headers['ETag']
+                        })
 
-        try:
-            response = requests.get(
-                f"{self.api_url}/dataframesDates/{encoded_name}",
-                headers=self.headers,
-                params={'list': 'dates', 'column': column}
+                        logger.info(f"Uploaded part {part_number}, size: {len(part_data)} bytes")
+                        break
+
+                    except requests.exceptions.RequestException as e:
+                        if attempt == retries - 1:
+                            raise APIError(f"Failed to upload part {part_number}: {str(e)}")
+                        time.sleep(retry_delay * (2 ** attempt))
+
+            # Complete multipart upload
+            complete_response = self._make_request(
+                'POST',  # Note: Changed from POST to PUT to match server
+                url,
+                json={
+                    'parts': parts,
+                    'upload_id': upload_id,
+                },
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay
             )
-            response.raise_for_status()
-            return response.json()['dates']
 
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error listing dates: {error}")
+            return complete_response
 
-    def _make_upload_request(self, chunk_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Helper method to make the actual upload request"""
-        try:
-            response = requests.post(
-                f"{self.api_url}/dataframes/upload",
-                headers=self.headers,
-                json=chunk_info
-            )
-            response.raise_for_status()
-            return response.json()
+        except Exception as e:
+            if isinstance(e, (DataFrameClientError, APIError, AuthenticationError)):
+                raise
+            raise DataFrameClientError(f"Error in post dataframe: {str(e)}")
 
-        except requests.exceptions.RequestException as e:
-            error = getattr(e.response, 'json', lambda: {'error': str(e)})().get('error', str(e))
-            raise APIError(f"Error uploading chunk {chunk_info['chunk_index']}: {error}")
+    def _make_request(
+            self,
+            method: str,
+            url: str,
+            retries: int,
+            retry_delay: int,
+            timeout: int,
+            **kwargs
+    ) -> Dict[str, Any]:
+        """Helper method to make HTTP requests with retries"""
+        for attempt in range(retries):
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers=self.headers,
+                    timeout=timeout,
+                    **kwargs
+                )
+                response.raise_for_status()
+                return response.json()
+
+            except requests.exceptions.RequestException as e:
+                if attempt == retries - 1:
+                    raise APIError(f"Request failed after {retries} attempts: {str(e)}")
+                time.sleep(retry_delay * (2 ** attempt))

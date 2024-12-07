@@ -306,3 +306,58 @@ class DataFrameClient:
                 if attempt == retries - 1:
                     raise APIError(f"Request failed after {retries} attempts: {str(e)}")
                 time.sleep(retry_delay * (2 ** attempt))
+
+    def concat_dataframe(
+            self,
+            df: pd.DataFrame,
+            dataframe_name: str,
+            stream: bool = False,
+            retries: int = 3,
+            retry_delay: int = 1,
+            timeout: int = 300
+    ) -> Dict[str, Any]:
+        """
+        Update (append) data to an existing DataFrame through the API
+
+        Args:
+            df: pandas DataFrame with new data to append
+            dataframe_name: S3 key/path of the target file
+            stream: If True, use SQS streaming, if False do direct update
+            retries: Number of retries
+            retry_delay: Seconds to wait between retries
+            timeout: Request timeout in seconds
+
+        Returns:
+            Dict with update results
+        """
+        try:
+            self._refresh_token_if_needed()
+
+            if df.empty:
+                raise DataFrameClientError("DataFrame is empty")
+
+            # URL encode the key for path parameters
+            encoded_key = requests.utils.quote(dataframe_name, safe='')
+
+            url = f"{self.api_url}/dataframes/{encoded_key}/event-upload"
+
+            # Send update request
+            response = self._make_request(
+                'POST',
+                url,
+                json={
+                    'stream': stream,
+                    'data': df.to_dict('records')[0],  # Convert first row to dict
+                    'key': dataframe_name
+                },
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay
+            )
+
+            return response
+
+        except Exception as e:
+            if isinstance(e, (DataFrameClientError, APIError, AuthenticationError)):
+                raise
+            raise DataFrameClientError(f"Error in update dataframe: {str(e)}")

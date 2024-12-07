@@ -162,8 +162,8 @@ def test_concat_dataframe(client):
     assert result.get('message') == 'Event queued for streaming'
 
     # Wait for streaming concat to complete (you might want to adjust the wait time)
-    print('... Waiting for streaming concat to complete (the buffer update is every 10 minutes)')
-    time.sleep(600)  # Wait for SQS/Lambda processing
+    print('... Waiting for streaming concat to complete (the buffer update is every 60 seconds)')
+    time.sleep(65)  # Wait for SQS/Lambda processing
 
     # Verify the streaming concat
     try:

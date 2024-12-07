@@ -355,6 +355,9 @@ class DataFrameClient:
                 retry_delay=retry_delay
             )
 
+            if stream:
+                logger.info('Your latest data stream can take up to 60 seconds to be available')
+
             return response
 
         except Exception as e:

@@ -344,67 +344,6 @@ class DataFrameClient:
             logger.error(f'Some column format between the new dataframe'
                          f' and the one stored do not allow parquet conversion: {e}')
 
-    def concat_events(
-            self,
-            df: pd.DataFrame,
-            dataframe_name: str,
-            retries: int = 3,
-            retry_delay: int = 1,
-            timeout: int = 300
-    ) -> Dict[str, Any]:
-        """
-        Update (append) new events data to an existing DataFrame through the API
-
-        Args:
-            df: pandas DataFrame with new data to append
-            dataframe_name: S3 key/path of the target file
-            stream: If True, use SQS streaming, if False do direct update
-            retries: Number of retries
-            retry_delay: Seconds to wait between retries
-            timeout: Request timeout in seconds
-
-        Returns:
-            Dict with update results
-        """
-        try:
-            self._refresh_token_if_needed()
-
-            if df.empty:
-                raise DataFrameClientError("DataFrame is empty")
-
-            if len(df) > 20:
-                raise ValueError('This method is to concat real time events: '
-                                 'small chunks of ideally 1 single row and up to 20 rows.'
-                                 'For larger batch concats it is more reliable for you to do: '
-                                 'get_dataframe(), pd.concat() on your own and post_dataframe()')
-
-            # URL encode the key for path parameters
-            encoded_key = requests.utils.quote(dataframe_name, safe='')
-
-            url = f"{self.api_url}/dataframes/{encoded_key}/event-upload"
-
-            # Send update request
-            response = self._make_request(
-                'POST',
-                url,
-                json={
-                    'data': df.to_dict('records'),
-                    'key': dataframe_name
-                },
-                timeout=timeout,
-                retries=retries,
-                retry_delay=retry_delay
-            )
-
-            logger.info('Your latest data stream can take up to 60 seconds to be available')
-
-            return response
-
-        except Exception as e:
-            if isinstance(e, (DataFrameClientError, APIError, AuthenticationError)):
-                raise
-            raise DataFrameClientError(f"Error in update dataframe: {str(e)}")
-
     def delete_folder(
             self,
             folder_path: str,

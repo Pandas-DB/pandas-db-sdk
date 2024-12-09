@@ -47,30 +47,25 @@ def test_post_dataframe(client):
     result = client.post_dataframe(
         df=large_df,
         dataframe_name='testZ/large-file',
-        chunk_size=10 * 1024 * 1024
+        chunk_size=5 * 1024 * 1024
     )
     print(f"Uploaded {len(large_df)} rows | "
           f"In: {round(time.time() - start_time)} seconds | "
           f"Avg performance: {round(len(large_df) / (time.time() - start_time))} rows uploaded per second")
     assert result.get('key')
 
-# TODO esto no esta implementado
-    print('... Upload multiple dataframes async')
-    dfs_to_upload = [
-        (small_df, 'testZ/multi-upload-1'),
-        (small_df, 'testZ/multi-upload-2'),
-        (small_df, 'testZ/multi-upload-3')
-    ]
+    print('... Upload xtra-large dataframe')
+    xtra_large_df = create_test_dataframe(10**6)
     start_time = time.time()
-    results = client.post_dataframe_async(
-        dfs=dfs_to_upload,
-        chunk_size=5 * 1024 * 1024,
-        max_workers=3
+    result = client.post_dataframe(
+        df=xtra_large_df,
+        dataframe_name='testZ/xtra-large-file',
+        chunk_size=5 * 1024 * 1024
     )
-    print(f"Uploaded {len(dfs_to_upload)} files | "
-          f"In: {time.time() - start_time} seconds | "
-          f"Avg performance: {len(dfs_to_upload)} / {time.time() - start_time} files uploaded per second")
-    assert len(results) == len(dfs_to_upload)
+    print(f"Uploaded {len(xtra_large_df)} rows | "
+          f"In: {round(time.time() - start_time)} seconds | "
+          f"Avg performance: {round(len(xtra_large_df) / (time.time() - start_time))} rows uploaded per second")
+    assert result.get('key')
 
 
 def test_get_dataframe(client):
@@ -84,18 +79,22 @@ def test_get_dataframe(client):
           f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
     assert not df.empty
 
+    df = client.get_dataframe(
+        dataframe_name='testZ/small-file',
+        query="SELECT * FROM s3object WHERE transaction_date = CAST('2024-01-01' AS TIMESTAMP)")
+    assert len(df) == 1
+
     print('... Retrieve large dataframe with query')
     start_time = time.time()
     # Single file query
     df = client.get_dataframe(
         dataframe_name='testZ/large-file',
-        query="SELECT * FROM s3object WHERE transaction_date = '2024-01-01'",
+        query="SELECT * FROM s3object WHERE transaction_date = CAST('2024-01-01' AS TIMESTAMP)"
     )
     print(f"Retrieved {len(df)} rows | "
           f"In: {round(time.time() - start_time, 2)} seconds | "
           f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
-# TODO no devuelve el df con los nombres de las columnas!!
-    # assert df['transaction_date'].unique().values == '2024-01-01'
+    assert df['transaction_date'].nunique() == 1
 
     # Take the whole large dataframe
     print('... Retrieve large dataframe')
@@ -105,8 +104,7 @@ def test_get_dataframe(client):
     print(f"Retrieved {len(df)} rows | "
           f"In: {round(time.time() - start_time, 2)} seconds | "
           f"Avg performance: {round(len(df) / (time.time() - start_time))} rows retrieved per second")
-# TODO este falla por los headers
-    # assert df == create_test_dataframe()
+    assert len(df) == len(create_test_dataframe())
 
 
 def test_concat_dataframe(client):
@@ -131,32 +129,15 @@ def test_concat_dataframe(client):
         'transaction_date': ['2024-01-04'],
         'user_id': [1004],
         'amount': [400],
-        'category': ['B']
+        'category': ['C']
     })
-
-    # Test direct concat (no streaming)
-    print('... Testing direct concat')
-    start_time = time.time()
-    result = client.concat_dataframe(
-        df=concat_df,
-        dataframe_name='testZ/concat-test',
-        stream=False
-    )
-    print(f"Direct concat completed in: {round(time.time() - start_time, 2)} seconds")
-    assert result.get('message') == 'Data appended successfully'
-
-    # Verify the concat
-    concatd_df = client.get_dataframe('testZ/concat-test')
-# TODO falla por el header (nombre columnas)
-    # assert len(concatd_df) == len(base_df) + 1
 
     # Test streaming concat
     print('... Testing streaming concat')
     start_time = time.time()
-    result = client.concat_dataframe(
+    result = client.concat_events(
         df=concat_df,
-        dataframe_name='testZ/concat-test-stream',
-        stream=True
+        dataframe_name='testZ/concat-test',
     )
     print(f"Streaming concat initiated in: {round(time.time() - start_time, 2)} seconds")
     assert result.get('message') == 'Event queued for streaming'
@@ -167,7 +148,7 @@ def test_concat_dataframe(client):
 
     # Verify the streaming concat
     try:
-        streamed_df = client.get_dataframe('testZ/concat-test-stream')
+        streamed_df = client.get_dataframe('testZ/concat-test')
         assert len(streamed_df) > 0
     except Exception as e:
         print(f"Note: Streaming verification might fail if processing isn't complete: {str(e)}")
@@ -182,15 +163,14 @@ def main():
     )
 
     try:
-# TODO descomentar
-        # print("Testing posting data...")
-        # test_post_dataframe(client)
+        print("Testing posting data...")
+        test_post_dataframe(client)
 
-        # print("Testing data retrieval...")
-        # test_get_dataframe(client)
+        print("Testing data retrieval...")
+        test_get_dataframe(client)
 
-        print("Testing data concats...")
-        test_concat_dataframe(client)
+        # print("Testing data concats...")
+        # test_concat_dataframe(client)
 
     except Exception as e:
         print(f"Test failed: {str(e)}")

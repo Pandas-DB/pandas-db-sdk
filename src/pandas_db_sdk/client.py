@@ -1,4 +1,4 @@
-from io import StringIO
+from io import BytesIO
 import pandas as pd
 import boto3
 import requests
@@ -140,16 +140,23 @@ class DataFrameClient:
             for attempt in range(retries):
                 try:
                     if chunk_size:
-                        # Stream large files
+                        # Stream large files in chunks
                         chunks = []
-                        with requests.get(download_url, stream=True, timeout=timeout) as r:
+                        with requests.get(download_url, stream=True) as r:
                             r.raise_for_status()
-                            for chunk in pd.read_csv(r.raw, chunksize=chunk_size):
+                            for chunk in pd.read_parquet(r.raw, chunksize=chunk_size):
                                 chunks.append(chunk)
                         df = pd.concat(chunks, ignore_index=True)
                     else:
-                        # Small files
                         df = pd.read_csv(download_url)
+
+                    # Add column names to DataFrame if they were returned by the API
+                    if data.get('columns'):
+                        # Ensure column names match if they exist
+                        if len(df.columns) == len(data['columns']):
+                            df.columns = data['columns']
+                        else:
+                            logger.warning("Column count mismatch between data and metadata")
 
                     logger.info(f"Successfully downloaded data: {len(df)} rows")
                     return df
@@ -208,14 +215,14 @@ class DataFrameClient:
             )
             upload_id = response['upload_id']
 
-            # Convert DataFrame to CSV data
-            csv_buffer = StringIO()
-            df.to_csv(csv_buffer, index=False)
-            csv_buffer.seek(0)
-            csv_data = csv_buffer.getvalue().encode('utf-8')
+            # Convert DataFrame to Parquet data
+            parquet_buffer = BytesIO()
+            df.to_parquet(parquet_buffer, index=False)
+            parquet_buffer.seek(0)
+            parquet_data = parquet_buffer.getvalue()
 
             # Calculate parts
-            total_size = len(csv_data)
+            total_size = len(parquet_data)
             parts = []
 
             # Upload parts
@@ -236,7 +243,7 @@ class DataFrameClient:
                 # Upload the part
                 start_pos = (part_number - 1) * chunk_size
                 end_pos = min(start_pos + chunk_size, total_size)
-                part_data = csv_data[start_pos:end_pos]
+                part_data = parquet_data[start_pos:end_pos]
 
                 for attempt in range(retries):
                     try:
@@ -307,17 +314,16 @@ class DataFrameClient:
                     raise APIError(f"Request failed after {retries} attempts: {str(e)}")
                 time.sleep(retry_delay * (2 ** attempt))
 
-    def concat_dataframe(
+    def concat_events(
             self,
             df: pd.DataFrame,
             dataframe_name: str,
-            stream: bool = False,
             retries: int = 3,
             retry_delay: int = 1,
             timeout: int = 300
     ) -> Dict[str, Any]:
         """
-        Update (append) data to an existing DataFrame through the API
+        Update (append) new events data to an existing DataFrame through the API
 
         Args:
             df: pandas DataFrame with new data to append
@@ -336,6 +342,12 @@ class DataFrameClient:
             if df.empty:
                 raise DataFrameClientError("DataFrame is empty")
 
+            if len(df) > 20:
+                raise ValueError('This method is to concat real time events: '
+                                 'small chunks of ideally 1 single row and up to 20 rows.'
+                                 'For larger batch concats it is more reliable for you to do: '
+                                 'get_dataframe(), pd.concat() on your own and post_dataframe()')
+
             # URL encode the key for path parameters
             encoded_key = requests.utils.quote(dataframe_name, safe='')
 
@@ -346,8 +358,7 @@ class DataFrameClient:
                 'POST',
                 url,
                 json={
-                    'stream': stream,
-                    'data': df.to_dict('records')[0],  # Convert first row to dict
+                    'data': df.to_dict('records'),
                     'key': dataframe_name
                 },
                 timeout=timeout,
@@ -355,8 +366,7 @@ class DataFrameClient:
                 retry_delay=retry_delay
             )
 
-            if stream:
-                logger.info('Your latest data stream can take up to 60 seconds to be available')
+            logger.info('Your latest data stream can take up to 60 seconds to be available')
 
             return response
 

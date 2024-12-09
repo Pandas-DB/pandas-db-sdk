@@ -16,7 +16,6 @@ from .models import (
     APIError,
 )
 from .auth import AuthManager
-from .utils import convert_numpy_types
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -314,6 +313,37 @@ class DataFrameClient:
                     raise APIError(f"Request failed after {retries} attempts: {str(e)}")
                 time.sleep(retry_delay * (2 ** attempt))
 
+    def concat_dataframe(self,
+            new_df: pd.DataFrame,
+            dataframe_name: str,
+            chunk_size: int = 5 * 1024 * 1024,  # 5MB chunks
+            retries: int = 3,
+            retry_delay: int = 1,
+            timeout: int = 300):
+        logger.warning('Use it with Caution! If you want to concat events '
+                       '(small size dataframes many times a day) '
+                       'this method can become very expensive')
+        df = self.get_dataframe(
+                dataframe_name=dataframe_name,
+                retries=retries,
+                retry_delay=retry_delay,
+                timeout=timeout)
+
+        df_concat = pd.concat([new_df, df])
+
+        try:
+            self.post_dataframe(
+                df=df_concat,
+                dataframe_name=dataframe_name,
+                chunk_size=chunk_size,
+                retries=retries,
+                retry_delay=retry_delay,
+                timeout=timeout,
+            )
+        except DataFrameClientError as e:
+            logger.error(f'Some column format between the new dataframe'
+                         f' and the one stored do not allow parquet conversion: {e}')
+
     def concat_events(
             self,
             df: pd.DataFrame,
@@ -374,3 +404,48 @@ class DataFrameClient:
             if isinstance(e, (DataFrameClientError, APIError, AuthenticationError)):
                 raise
             raise DataFrameClientError(f"Error in update dataframe: {str(e)}")
+
+    def delete_folder(
+            self,
+            folder_path: str,
+            retries: int = 3,
+            retry_delay: int = 1,
+            timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        Delete a folder and all its contents from S3 through the API
+
+        Args:
+            folder_path: S3 path/prefix to delete
+            retries: Number of retries
+            retry_delay: Seconds to wait between retries
+            timeout: Request timeout in seconds
+
+        Returns:
+            Dict with deletion results
+        """
+        try:
+            self._refresh_token_if_needed()
+
+            if not folder_path:
+                raise DataFrameClientError("Folder path is required")
+
+            # URL encode the path for API call
+            encoded_path = requests.utils.quote(folder_path, safe='')
+            url = f"{self.api_url}/dataframes/{encoded_path}/delete"
+
+            # Send delete request
+            response = self._make_request(
+                'DELETE',
+                url,
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay
+            )
+
+            return response
+
+        except Exception as e:
+            if isinstance(e, (DataFrameClientError, APIError, AuthenticationError)):
+                raise
+            raise DataFrameClientError(f"Error in delete folder: {str(e)}")
